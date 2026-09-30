@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>符号表与作用域 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <button class="btn primary" id="btn-build">🏷️ 生成符号表</button>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="card mt">
+        <div class="flex between">
+          <h2>符号表与作用域链</h2>
+          <div id="sym-stats" class="muted" style="font-size:12px"></div>
+        </div>
+        <div class="desc">语义分析阶段建立的作用域树。每个作用域是一个符号表，名字查找沿作用域链由内向外进行。</div>
+        <div id="scopes"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("symbols");
+  ML.Shell.setTitle("符号表与作用域");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 220,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const KIND = { variable: ["变量", "blue"], parameter: ["形参", "cyan"], function: ["函数", "purple"], builtin: ["内置", "green"] };
+  const SCOPE = { global: "全局作用域", function: "函数作用域", block: "块作用域" };
+
+  function renderScope(scope, depth) {
+    const kindLbl = SCOPE[scope.type] || scope.type;
+    const syms = scope.symbols || [];
+    let html = `<div class="scope-box" style="margin-left:${Math.min(depth * 24, 96)}px">`;
+    html += `<div class="head">📦 ${esc(scope.name)} <span class="badge purple">${esc(kindLbl)}</span>` +
+      `<span class="depth">深度 ${scope.depth} · ${syms.length} 个符号 · id=${scope.scope_id}</span></div>`;
+    html += `<div class="body">`;
+    if (!syms.length) html += `<div class="sym" style="color:var(--text-faint)">（空作用域）</div>`;
+    for (const s of syms) {
+      const [kl, kc] = KIND[s.kind] || [s.kind, "gray"];
+      html += `<div class="sym">
+        <span class="name">${esc(s.name)}</span>
+        <span class="badge ${kc}">${esc(kl)}</span>
+        <span class="badge cyan">${esc(s.type)}</span>
+        ${s.is_const ? '<span class="badge gray">const</span>' : ""}
+        <span class="loc">L${s.line}:C${s.column} · 引用 ${s.references} 次</span>
+      </div>`;
+    }
+    html += `</div></div>`;
+    for (const c of scope.children || []) html += renderScope(c, depth + 1);
+    return html;
+  }
+
+  async function build() {
+    const code = editor.getValue();
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    const out = document.getElementById("scopes");
+    if (!r.has_symbols || !r.symbols) {
+      out.innerHTML = `<div class="empty"><div class="big">🚫</div>无法生成符号表（编译未通过）。<br><a href="diagnostics.html">前往诊断页查看错误</a></div>`;
+      document.getElementById("sym-stats").textContent = "";
+      return;
+    }
+    out.innerHTML = renderScope(r.symbols, 0);
+    const countSymbols = (s) => (s.symbols || []).length + (s.children || []).reduce((a, c) => a + countSymbols(c), 0);
+    const countScopes = (s) => 1 + (s.children || []).reduce((a, c) => a + countScopes(c), 0);
+    document.getElementById("sym-stats").textContent = `${countScopes(r.symbols)} 个作用域 · ${countSymbols(r.symbols)} 个符号`;
+  }
+
+  document.getElementById("btn-build").onclick = build;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+// 冒泡排序（演示性能剖析的热点函数与耗时）
+func bubble(arr) {
+    var n = len(arr);
+    for (var i = 0; i < n - 1; i = i + 1) {
+        for (var j = 0; j < n - i - 1; j = j + 1) {
+            if (arr[j] > arr[j + 1]) {
+                var tmp = arr[j];
+                arr[j] = arr[j + 1];
+                arr[j + 1] = tmp;
+            }
+        }
+    }
+    return arr;
+}
+
+var numbers = [9, 4, 7, 1, 8, 2, 6, 3, 5, 0];
+var sorted = bubble(numbers);
+print("排序结果 =", sorted);
+print("耗时函数 bubble 被调用 1 次，内部循环次数 =", len(sorted) * (len(sorted) - 1) / 2);

@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-09-30T11:19:16",
+  "description": "",
+  "id": "proj-1023bb1ef0cd",
+  "language": "minilang",
+  "last_source": "// 冒泡排序（演示性能剖析的热点函数与耗时）\nfunc bubble(arr) {\n    var n = len(arr);\n    for (var i = 0; i < n - 1; i = i + 1) {\n        for (var j = 0; j < n - i - 1; j = j + 1) {\n            if (arr[j] > arr[j + 1]) {\n                var tmp = arr[j];\n                arr[j] = arr[j + 1];\n                arr[j + 1] = tmp;\n            }\n        }\n    }\n    return arr;\n}\n\nvar numbers = [9, 4, 7, 1, 8, 2, 6, 3, 5, 0];\nvar sorted = bubble(numbers);\nprint(\"排序结果 =\", sorted);\nprint(\"耗时函数 bubble 被调用 1 次，内部循环次数 =\", len(sorted) * (len(sorted) - 1) / 2);\n",
+  "name": "排序与性能剖析",
+  "updated_at": "2026-09-30T11:19:16",
+  "version_count": 1
+}

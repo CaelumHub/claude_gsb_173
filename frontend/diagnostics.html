@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>错误诊断与修复 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <div class="flex" style="gap:4px" id="filters">
+            <button class="btn sm active" data-f="all">全部</button>
+            <button class="btn sm" data-f="error">错误</button>
+            <button class="btn sm" data-f="warning">警告</button>
+          </div>
+          <button class="btn" id="btn-fixall">⚡ 一键修复</button>
+          <button class="btn primary" id="btn-build">🩺 运行诊断</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+
+      <div id="diag-status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+      <div class="card mt">
+        <h2>诊断与修复建议</h2>
+        <div class="desc">编译器前端四个阶段（词法 / 语法 / 语义 / 运行期）的诊断都汇总在此，附带源码高亮与「did-you-mean」修复建议。带 ⚡ 按钮的诊断可一键应用快速修复。</div>
+        <div id="diags"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("diagnostics");
+  ML.Shell.setTitle("错误诊断与修复");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.SAMPLES[3].code), height: 260,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const esc = ML.escapeHtml;
+  let allDiags = [], filter = "all", currentSource = "";
+
+  function renderDiagWithFix(d) {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = ML.renderDiagnostic(d, currentSource);
+    const card = wrap.firstElementChild;
+    if (d.fix_hint && card) {
+      const hint = d.fix_hint.action === "replace" ? `将 [${d.fix_hint.start},${d.fix_hint.end}) 替换为 "${d.fix_hint.text}"`
+        : `在 L${d.line} 末尾插入 "${d.fix_hint.text}"`;
+      const btn = document.createElement("button");
+      btn.className = "btn sm success";
+      btn.style.marginTop = "8px";
+      btn.title = hint;
+      btn.textContent = "⚡ 应用修复";
+      btn.onclick = () => applyFix(d);
+      card.appendChild(btn);
+    }
+    return wrap.innerHTML;
+  }
+
+  function render() {
+    const list = allDiags.filter((d) => filter === "all" || d.severity === filter);
+    document.getElementById("diags").innerHTML = list.length
+      ? list.map(renderDiagWithFix).join("") : ML.empty("✅ 无诊断信息");
+    document.querySelectorAll("#filters .btn").forEach((b) => b.classList.toggle("active", b.dataset.f === filter));
+  }
+
+  function applyFixToSource(src, d) {
+    const h = d.fix_hint;
+    if (!h) return src;
+    if (h.action === "replace" && h.start >= 0 && h.end >= 0) {
+      return src.slice(0, h.start) + h.text + src.slice(h.end);
+    }
+    if (h.action === "insert") {
+      const lines = src.split("\n");
+      const idx = Math.max(0, (d.line || 1) - 1);
+      if (idx < lines.length) { lines[idx] = lines[idx] + h.text; return lines.join("\n"); }
+      return src + h.text;
+    }
+    return src;
+  }
+
+  async function build(src) {
+    src = src != null ? src : editor.getValue();
+    currentSource = src;
+    const data = await ML.api.compile(src);
+    const r = data.result || {};
+    allDiags = r.diagnostics || [];
+    const errs = allDiags.filter((d) => d.severity === "error").length;
+    const warns = allDiags.filter((d) => d.severity === "warning").length;
+    document.getElementById("diag-status").innerHTML =
+      (errs ? ML.badge("错误 " + errs, "red") : ML.badge("错误 0", "green")) +
+      (warns ? ML.badge("警告 " + warns, "amber") : ML.badge("警告 0", "green")) +
+      ML.badge("阶段：" + (r.stage || "idle"), "gray") +
+      ML.badge("词法 token " + (r.token_count != null ? r.token_count : "—"), "gray") +
+      (r.success ? ML.badge("编译通过", "green") : ML.badge("编译失败", "red"));
+    render();
+    return r;
+  }
+
+  async function applyFix(d) {
+    const src = applyFixToSource(editor.getValue(), d);
+    editor.setValue(src);
+    ML.toast("已应用修复", "ok");
+    await build(src);
+  }
+
+  document.getElementById("btn-build").onclick = () => build();
+  document.getElementById("btn-fixall").onclick = async () => {
+    let src = editor.getValue();
+    let applied = 0;
+    for (let pass = 0; pass < 30; pass++) {
+      const data = await ML.api.compile(src);
+      const r = data.result || {};
+      const fixable = (r.diagnostics || []).filter((d) => d.severity === "error" && d.fix_hint);
+      if (!fixable.length) break;
+      src = applyFixToSource(src, fixable[0]);
+      applied++;
+    }
+    editor.setValue(src);
+    ML.toast(applied ? `已应用 ${applied} 处修复` : "没有可自动修复的错误", applied ? "ok" : "");
+    await build(src);
+  };
+  document.querySelectorAll("#filters .btn").forEach((b) => b.onclick = () => { filter = b.dataset.f; render(); });
+})();
+</script>
+</body>
+</html>

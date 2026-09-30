@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-09-30T11:19:16",
+  "description": "",
+  "id": "proj-ab46750838f8",
+  "language": "minilang",
+  "last_source": "// 递归计算斐波那契数列（演示调用栈 / 断点 / 单步）\nfunc fib(n) {\n    if (n < 2) {\n        return n;\n    }\n    return fib(n - 1) + fib(n - 2);\n}\n\nfunc main_program() {\n    for (var i = 0; i < 12; i = i + 1) {\n        print(\"fib(\", i, \") =\", fib(i));\n    }\n}\n\nmain_program();\n",
+  "name": "斐波那契数列",
+  "updated_at": "2026-09-30T11:19:16",
+  "version_count": 1
+}

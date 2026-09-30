@@ -1,0 +1,10 @@
+// 这段代码包含若干错误，用于演示错误诊断与修复建议
+var radius = 5;
+var area = 3.14159 * radius * radus;   // 拼写错误：radus -> radius
+
+if (area > 0 {
+    print("面积 =", area)              // 缺少右括号
+}
+
+var arr = [10, 20, 30];
+print(arr[5]);                          // 下标越界（运行时错误）

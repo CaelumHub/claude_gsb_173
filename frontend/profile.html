@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>性能分析 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+          <label class="flex" style="gap:4px;font-size:12px;color:var(--text-muted)">采样间隔(ms)
+            <input type="number" id="sample-ms" value="1" min="0.05" step="0.1" style="width:76px">
+          </label>
+        </div>
+        <button class="btn primary" id="btn-prof">📈 运行剖析</button>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="grid cols-3 mt" id="stats" style="display:none"></div>
+
+      <div class="card mt">
+        <h2>⏱ 精确插桩（函数耗时 / 调用次数 / 热点行）</h2>
+        <div class="desc">解释器逐条指令上报当前函数与行号，得到确定性的调用次数、自身耗时与热点行。</div>
+        <div id="inst-funcs"></div>
+        <div id="inst-table"></div>
+      </div>
+
+      <div class="card">
+        <h2>🎲 统计采样（后台线程定时采样）</h2>
+        <div class="desc">后台线程以固定间隔读取解释器当前位置，累积为采样直方图，近似各函数的时间占比（原理同 py-spy / perf）。</div>
+        <div id="sample-funcs"></div>
+        <div id="sample-lines"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("profile");
+  ML.Shell.setTitle("性能分析");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.SAMPLES[2].code), height: 260,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const esc = ML.escapeHtml;
+
+  function barRow(label, value, max, suffix) {
+    const pct = max > 0 ? (value / max) * 100 : 0;
+    return `<div class="bar-row"><div class="lbl" title="${esc(label)}">${esc(label)}</div>` +
+      `<div class="track"><div class="fill" style="width:${Math.min(100, pct)}%"></div></div>` +
+      `<div class="pct">${suffix || ""}${value}</div></div>`;
+  }
+
+  function render(prof) {
+    document.getElementById("stats").style.display = "grid";
+    document.getElementById("stats").innerHTML =
+      `<div class="stat-tile"><div class="v">${ML.fmtMs(prof.total_time_ms)}</div><div class="k">总耗时</div></div>` +
+      `<div class="stat-tile"><div class="v">${prof.total_instructions}</div><div class="k">总指令数</div></div>` +
+      `<div class="stat-tile"><div class="v">${prof.function_count}</div><div class="k">函数数</div></div>`;
+
+    // 插桩：函数条形图
+    const fns = prof.functions || [];
+    const maxSelf = Math.max(1, ...fns.map((f) => f.self_ms));
+    document.getElementById("inst-funcs").innerHTML = fns.length
+      ? fns.map((f) => barRow(`${f.name}（调用 ${f.calls} 次）`, f.self_ms, maxSelf, "")) +
+        `<div class="muted" style="font-size:11px;margin-top:4px">条形长度按「自身耗时 self_ms」归一化</div>`
+      : ML.empty("无函数剖析数据");
+
+    // 插桩：明细表
+    document.getElementById("inst-table").innerHTML = fns.length ? `
+      <table class="tbl" style="margin-top:12px">
+        <thead><tr><th>函数</th><th class="num">调用</th><th class="num">自身耗时</th><th class="num">总耗时</th><th class="num">子调用</th><th class="num">占比</th><th>热点行</th></tr></thead>
+        <tbody>` + fns.map((f) => {
+          const hot = (f.hot_lines || []).slice(0, 4).map((h) => `<span class="badge amber" style="font-family:var(--mono)">L${h.line}×${h.hits}</span>`).join(" ");
+          return `<tr><td class="mono">${esc(f.name)}</td><td class="num">${f.calls}</td>
+            <td class="num">${ML.fmtMs(f.self_ms)}</td><td class="num">${ML.fmtMs(f.total_ms)}</td>
+            <td class="num">${ML.fmtMs(f.child_ms)}</td><td class="num">${f.pct}%</td>
+            <td>${hot || '<span class="muted">—</span>'}</td></tr>`;
+        }).join("") + `</tbody></table>` : "";
+
+    // 采样：函数直方图
+    const samp = prof.sampling || {};
+    const sf = samp.functions || [];
+    const maxS = Math.max(1, ...sf.map((f) => f.samples));
+    document.getElementById("sample-funcs").innerHTML = sf.length
+      ? sf.map((f) => barRow(`${f.name}（${f.samples} 样本）`, f.samples, maxS, f.pct + "% · ")) +
+        `<div class="muted" style="font-size:11px;margin-top:4px">共 ${samp.sample_count} 个样本 · 间隔 ${samp.interval_ms} ms</div>`
+      : ML.empty("采样样本不足（程序过快结束）");
+
+    // 采样：热点行
+    const sl = samp.lines || [];
+    document.getElementById("sample-lines").innerHTML = sl.length
+      ? `<table class="tbl" style="margin-top:12px"><thead><tr><th>函数</th><th class="num">行</th><th class="num">样本</th><th class="num">占比</th></tr></thead><tbody>` +
+        sl.map((l) => `<tr><td class="mono">${esc(l.func)}</td><td class="num">${l.line}</td><td class="num">${l.samples}</td><td class="num">${l.pct}%</td></tr>`).join("") +
+        `</tbody></table>` : "";
+  }
+
+  async function run() {
+    const code = editor.getValue();
+    const interval = parseFloat(document.getElementById("sample-ms").value) || 1;
+    const data = await ML.api.run(code, { profile: true, sample: true, sample_interval_ms: interval });
+    const r = data.result || {};
+    if (!r.ok) {
+      ML.toast("编译失败，无法剖析", "err");
+      document.getElementById("inst-funcs").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
+      document.getElementById("inst-table").innerHTML = "";
+      document.getElementById("sample-funcs").innerHTML = "";
+      document.getElementById("sample-lines").innerHTML = "";
+      document.getElementById("stats").style.display = "none";
+      return;
+    }
+    render(r.profile || { functions: [], sampling: {}, total_time_ms: 0, total_instructions: 0, function_count: 0 });
+  }
+
+  document.getElementById("btn-prof").onclick = run;
+})();
+</script>
+</body>
+</html>

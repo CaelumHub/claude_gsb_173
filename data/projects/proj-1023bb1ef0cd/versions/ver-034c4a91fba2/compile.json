@@ -1,0 +1,20 @@
+{
+  "diagnostics": [
+    {
+      "column": 17,
+      "end_column": 20,
+      "end_line": 7,
+      "fix": "删除无用的声明，或在你需要的表达式里使用它。",
+      "fix_hint": null,
+      "kind": "name",
+      "length": 3,
+      "line": 7,
+      "message": "变量 'tmp' 已声明但从未使用",
+      "phase": "semantic",
+      "related": [],
+      "severity": "warning"
+    }
+  ],
+  "stage": "compiled",
+  "success": true
+}

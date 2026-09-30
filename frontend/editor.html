@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>代码编辑器 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample" title="载入示例代码"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <button class="btn" id="btn-compile">⚙ 编译</button>
+          <button class="btn accent" id="btn-run">▶ 运行</button>
+          <button class="btn" id="btn-prof">📈 运行 + 剖析</button>
+          <button class="btn success" id="btn-save">💾 保存版本</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+
+      <div id="status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+
+      <div class="grid cols-2 mt">
+        <div class="card">
+          <h2>▶ 控制台输出</h2>
+          <div class="output-console" id="console"><span class="muted">尚未运行。点击「运行」执行当前代码。</span></div>
+          <div class="muted mt" id="run-meta" style="font-size:12px"></div>
+        </div>
+        <div class="card">
+          <h2>🩺 诊断信息</h2>
+          <div id="diags"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("editor");
+  ML.Shell.setTitle("代码编辑器");
+
+  let editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE),
+    height: 420,
+    autocomplete: true,
+    onValueChange: ML.debounce((v) => ML.store.set("draft_source", v), 400),
+  });
+
+  /* 示例下拉 */
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => {
+    if (sampleSel.value === "") return;
+    editor.setValue(ML.SAMPLES[parseInt(sampleSel.value, 10)].code);
+    sampleSel.value = "";
+  };
+
+  document.getElementById("btn-loadproj").onclick = async () => {
+    const src = await ML.Shell.loadSource(ML.DEFAULT_CODE);
+    editor.setValue(src);
+    ML.toast(ML.Shell.getProjectId() ? "已载入项目源码" : "未选择项目，已载入示例代码");
+  };
+
+  /* 编译 */
+  async function doCompile() {
+    const code = editor.getValue();
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    const status = document.getElementById("status");
+    const badges = [
+      r.success ? ML.badge("编译通过", "green") : ML.badge("编译失败", "red"),
+      ML.badge("阶段：" + (r.stage || "idle"), "gray"),
+      ML.badge("词法 token：" + (r.token_count != null ? r.token_count : "—"), "gray"),
+      r.has_ast ? ML.badge("AST ✓", "blue") : ML.badge("AST ✗", "gray"),
+      r.has_symbols ? ML.badge("符号表 ✓", "purple") : ML.badge("符号表 ✗", "gray"),
+      r.has_bytecode ? ML.badge("字节码 ✓", "cyan") : ML.badge("字节码 ✗", "gray"),
+    ];
+    if (r.has_ast) badges.push(`<a href="ast.html">🌳 AST</a>`);
+    if (r.has_symbols) badges.push(`<a href="symbols.html">🏷️ 符号表</a>`);
+    if (r.has_bytecode) badges.push(`<a href="bytecode.html">🧩 字节码</a>`);
+    status.innerHTML = badges.join("");
+    document.getElementById("diags").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
+    return r;
+  }
+
+  /* 运行 */
+  async function doRun(profile) {
+    const code = editor.getValue();
+    const opts = profile ? { profile: true, memory: false } : {};
+    const data = await ML.api.run(code, opts);
+    const r = data.result || {};
+    const consoleEl = document.getElementById("console");
+    const meta = document.getElementById("run-meta");
+
+    if (!r.ok) {
+      consoleEl.innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
+      document.getElementById("diags").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
+      meta.textContent = "编译失败：" + (r.stage || "");
+      return;
+    }
+
+    if (r.output && r.output.length) {
+      consoleEl.innerHTML = r.output.map((l) => `<span class="ln-out">${ML.escapeHtml(l)}</span>`).join("<br>");
+    } else {
+      consoleEl.innerHTML = '<span class="muted">（程序无输出）</span>';
+    }
+
+    let metaHtml = `⏱ ${ML.fmtMs(r.elapsed_ms)} · 指令 ${r.instruction_count}`;
+    if (r.error) {
+      metaHtml += ` · ${ML.badge("运行出错", "red")}`;
+      const diag = Object.assign({}, r.error, { source_line: undefined });
+      document.getElementById("diags").innerHTML = ML.renderDiagnostic(diag, code);
+    } else {
+      metaHtml += ` · ${ML.badge("正常结束", "green")}`;
+      if (r.return_value) metaHtml += ` · 返回 ${ML.fmtVal(r.return_value)}`;
+      document.getElementById("diags").innerHTML = ML.empty("✅ 运行正常，无诊断信息");
+    }
+    meta.innerHTML = metaHtml;
+
+    if (profile && r.profile) {
+      const fns = (r.profile.functions || []).slice(0, 5);
+      document.getElementById("diags").innerHTML =
+        `<h3 style="margin-top:0">🔥 热点函数 Top ${fns.length}</h3>` +
+        fns.map((f) => `<div class="bar-row"><div class="lbl">${ML.escapeHtml(f.name)}</div>` +
+          `<div class="track"><div class="fill" style="width:${Math.min(100, f.pct)}%"></div></div>` +
+          `<div class="pct">${f.pct}%</div></div>`).join("") +
+        `<div class="muted" style="font-size:12px;margin-top:8px">完整剖析请前往 <a href="profile.html">性能分析页</a></div>`;
+    }
+  }
+
+  document.getElementById("btn-compile").onclick = doCompile;
+  document.getElementById("btn-run").onclick = () => doRun(false);
+  document.getElementById("btn-prof").onclick = () => doRun(true);
+  document.getElementById("btn-save").onclick = async () => {
+    if (!ML.Shell.getProjectId()) {
+      ML.toast("未选择项目。请先在顶栏选择项目，或到「项目管理」页新建。", "err");
+      return;
+    }
+    const msg = prompt("版本说明：", "从编辑器保存");
+    if (msg === null) return;
+    const v = await ML.Shell.saveToProject(editor.getValue(), msg);
+    ML.toast(v ? "已保存版本" : "保存失败", v ? "ok" : "err");
+  };
+})();
+</script>
+</body>
+</html>

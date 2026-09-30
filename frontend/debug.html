@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>执行跟踪与单步调试 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px" id="dbg-toolbar">
+          <button class="btn primary" id="btn-start">🐞 启动调试</button>
+          <button class="btn" id="btn-cont" disabled>▶ 继续</button>
+          <button class="btn" id="btn-stepi" disabled>单步(指令)</button>
+          <button class="btn" id="btn-stepin" disabled>单步(进入)</button>
+          <button class="btn" id="btn-stepover" disabled>单步(跳过)</button>
+          <button class="btn" id="btn-stepout" disabled>单步(跳出)</button>
+          <button class="btn danger" id="btn-stop" disabled>⏹ 停止</button>
+        </div>
+      </div>
+
+      <div class="muted mb" style="font-size:12.5px">💡 点击左侧行号设置 / 取消断点（红点），再点击「启动调试」。暂停原因会显示在下方状态栏。</div>
+
+      <div id="editor"></div>
+
+      <div id="dbg-status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+
+      <div class="grid cols-2 mt">
+        <div class="card">
+          <h2>📚 调用栈</h2>
+          <div id="callstack"></div>
+          <h3>局部变量（当前帧）</h3>
+          <div id="locals"></div>
+          <h3>全局变量</h3>
+          <div id="globals"></div>
+        </div>
+        <div class="card">
+          <h2>▶ 输出</h2>
+          <div class="output-console" id="console" style="min-height:80px;max-height:160px"></div>
+          <h3>下一指令</h3>
+          <div id="next-ins"></div>
+          <h3>操作数栈（栈顶）</h3>
+          <div id="operand"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("debug");
+  ML.Shell.setTitle("执行跟踪与单步调试");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 360, breakpoints: true,
+  });
+
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const REASON = { breakpoint: ["断点", "red"], step: ["单步", "blue"], entry: ["启动", "purple"], finished: ["已结束", "green"], error: ["出错", "red"] };
+  let sid = null, active = false;
+
+  function setButtons(on) {
+    ["btn-cont", "btn-stepi", "btn-stepin", "btn-stepover", "btn-stepout", "btn-stop"].forEach((id) => {
+      document.getElementById(id).disabled = !on;
+    });
+  }
+
+  function renderState(state) {
+    const status = document.getElementById("dbg-status");
+    if (!state.ok) {
+      if (state.compile_failed) {
+        status.innerHTML = ML.badge("编译失败，无法调试", "red");
+        document.getElementById("locals").innerHTML = ML.renderDiagnostics(state.diagnostics, editor.getValue());
+        setButtons(false);
+        active = false;
+        return;
+      }
+      status.innerHTML = ML.badge("会话不存在或已过期", "red");
+      setButtons(false);
+      active = false;
+      return;
+    }
+    if (state.not_started) {
+      status.innerHTML = ML.badge("未启动", "gray");
+      setButtons(false);
+      active = false;
+      return;
+    }
+
+    const [rl, rc] = REASON[state.reason] || [state.reason || "暂停", "gray"];
+    status.innerHTML =
+      ML.badge("暂停原因：" + rl, rc) +
+      ML.badge("指令 " + state.instruction_count, "gray") +
+      ML.badge("⏱ " + ML.fmtMs(state.elapsed_ms), "gray") +
+      (state.finished ? ML.badge("程序已结束", "green") : "");
+
+    // 当前行高亮
+    const line = state.next_instruction ? state.next_instruction.line : (state.current_position ? state.current_position[1] : null);
+    editor.setCurrentLine(line);
+
+    // 调用栈
+    const cs = document.getElementById("callstack");
+    const frames = state.call_stack || [];
+    if (!frames.length) cs.innerHTML = ML.empty("调用栈为空（程序已返回）");
+    else cs.innerHTML = `<div class="callstack">` + frames.map((f, i) =>
+      `<div class="frame ${i === 0 ? "top" : ""}">
+        <span class="fn">${esc(f.function)}</span><span class="ln">L${f.line}</span>
+        ${f.is_main ? '<span class="badge gray">main</span>' : ""}
+      </div>`).join("") + `</div>`;
+
+    // 局部变量
+    const locals = frames.length ? frames[0].locals : {};
+    document.getElementById("locals").innerHTML = renderVars(locals);
+
+    // 全局变量
+    document.getElementById("globals").innerHTML = renderVars(state.globals || {});
+
+    // 输出
+    const con = document.getElementById("console");
+    con.innerHTML = (state.output || []).length
+      ? state.output.map((l) => `<span class="ln-out">${esc(l)}</span>`).join("<br>")
+      : '<span class="muted">（暂无输出）</span>';
+
+    // 下一指令
+    const ni = state.next_instruction;
+    document.getElementById("next-ins").innerHTML = ni
+      ? `<div class="mono"><span class="badge purple">${esc(ni.op)}</span> <span class="arg">${ni.operand != null ? esc(String(ni.operand)) : ""}</span> <span class="muted">@ 偏移 ${ni.offset} · L${ni.line}</span></div>`
+      : '<span class="muted">—</span>';
+
+    // 操作数栈
+    const stack = state.operand_stack || [];
+    document.getElementById("operand").innerHTML = stack.length
+      ? stack.slice().reverse().map((v, i) => `<div class="mono" style="padding:2px 0">${i === 0 ? "栈顶 " : "     "}${ML.fmtVal(v)}</div>`).join("")
+      : '<span class="muted">（空）</span>';
+
+    if (state.error) {
+      document.getElementById("locals").innerHTML = ML.renderDiagnostic(state.error, editor.getValue());
+    }
+  }
+
+  function renderVars(vars) {
+    const keys = Object.keys(vars || {});
+    if (!keys.length) return '<span class="muted">（无）</span>';
+    return `<table class="tbl var-table"><thead><tr><th>名称</th><th>值</th></tr></thead><tbody>` +
+      keys.map((k) => `<tr><td class="mono">${esc(k)}</td><td class="v">${ML.fmtVal(vars[k])}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+
+  const esc = ML.escapeHtml;
+
+  async function start() {
+    const code = editor.getValue();
+    const data = await ML.api.debugStart(code, editor.getBreakpoints(), ML.Shell.getProjectId(), null);
+    if (data.ok && data.session_id) { sid = data.session_id; active = true; }
+    else active = false;
+    setButtons(active && !data.finished && !data.not_started && !data.compile_failed);
+    renderState(data);
+  }
+
+  async function cmd(command) {
+    if (!sid) return;
+    const data = await ML.api.debugCommand(sid, command, editor.getBreakpoints());
+    setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
+    renderState(data);
+  }
+
+  document.getElementById("btn-start").onclick = start;
+  document.getElementById("btn-cont").onclick = () => cmd("continue_");
+  document.getElementById("btn-stepi").onclick = () => cmd("step_instruction");
+  document.getElementById("btn-stepin").onclick = () => cmd("step_into");
+  document.getElementById("btn-stepover").onclick = () => cmd("step_over");
+  document.getElementById("btn-stepout").onclick = () => cmd("step_out");
+  document.getElementById("btn-stop").onclick = async () => {
+    if (sid) await ML.api.debugStop(sid);
+    sid = null; active = false; setButtons(false);
+    editor.setCurrentLine(null);
+    document.getElementById("dbg-status").innerHTML = ML.badge("已停止", "gray");
+  };
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>字节码 / 中间代码 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <button class="btn primary" id="btn-build">🧩 生成字节码</button>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="card mt">
+        <div class="flex between">
+          <h2>字节码 / 中间代码</h2>
+          <div id="bc-stats" class="muted" style="font-size:12px"></div>
+        </div>
+        <div class="desc">基于栈的字节码。编译器前端产出 AST 后，代码生成器将其翻译为线性指令序列，并做窥孔优化（去除 NOP、LOAD_CONST+POP、跳转折叠）。</div>
+        <div id="bc-fn-tabs" class="bc-fn-tabs"></div>
+        <div style="overflow:auto">
+          <table class="bc-table">
+            <thead><tr><th>偏移</th><th>操作码</th><th>操作数</th><th class="num">行</th></tr></thead>
+            <tbody id="bc-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>常量池</h2>
+        <div id="bc-constants" class="flex wrap"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("bytecode");
+  ML.Shell.setTitle("字节码 / 中间代码");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 220,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const OP_DESC = {
+    LOAD_CONST: "压入常量到栈顶", LOAD_VAR: "压入变量值（局部优先）", STORE_VAR: "弹出栈顶存入变量",
+    LOAD_GLOBAL: "压入全局变量值", STORE_GLOBAL: "弹出栈顶存入全局变量", LOAD_BUILTIN: "压入内置函数对象",
+    LOAD_FUNC: "压入用户函数对象", MAKE_FUNC: "定义函数并绑定到全局", BINARY: "弹出两个操作数做二元运算",
+    UNARY: "弹出一个操作数做一元运算", JUMP: "无条件跳转", JUMP_IF_FALSE: "栈顶为假则跳转",
+    JUMP_IF_TRUE: "栈顶为真则跳转", POP: "弹出并丢弃栈顶", DUP: "复制栈顶", DUP2: "复制栈顶两个元素",
+    CALL: "调用函数", RETURN: "返回（栈顶为返回值）", RETURN_NONE: "无返回值返回", MAKE_LIST: "构建列表",
+    INDEX_LOAD: "按下标读取", INDEX_STORE: "按下标写入", NOP: "空操作", LINE: "源码行号标记",
+  };
+
+  let bc = null, curFn = 0;
+
+  function operandHtml(ins, fc) {
+    const esc = ML.escapeHtml, op = ins.op, o = ins.operand;
+    if (op === "LOAD_CONST") {
+      const c = fc.constants[o];
+      return `<span class="arg">${o}</span> <span class="muted">→ ${esc(typeof c === "string" ? '"' + c + '"' : String(c))}</span>`;
+    }
+    if (op === "JUMP" || op === "JUMP_IF_FALSE" || op === "JUMP_IF_TRUE") {
+      return `<span class="arg">→ ${o}</span>`;
+    }
+    if (o == null || o === "") return '<span class="muted">—</span>';
+    if (Array.isArray(o)) return `<span class="arg">${esc(JSON.stringify(o))}</span>`;
+    return `<span class="arg">${esc(String(o))}</span>`;
+  }
+
+  function renderTabs() {
+    const el = document.getElementById("bc-fn-tabs");
+    el.innerHTML = bc.functions.map((f, i) => {
+      const label = f.is_main ? "&lt;main&gt;（顶层）" : `${esc(f.name)}(${f.params.join(", ")})`;
+      return `<button class="${i === curFn ? "active" : ""}" data-i="${i}">${label} <span class="muted">(${f.instructions.length})</span></button>`;
+    }).join("");
+    el.querySelectorAll("button").forEach((b) => b.onclick = () => { curFn = +b.dataset.i; renderTabs(); renderBody(); });
+  }
+
+  function renderBody() {
+    const fc = bc.functions[curFn];
+    document.getElementById("bc-body").innerHTML = fc.instructions.map((ins) => {
+      const desc = OP_DESC[ins.op] || "";
+      return `<tr title="${desc}">
+        <td class="off">${ins.offset}</td>
+        <td class="op">${esc(ins.op)}</td>
+        <td>${operandHtml(ins, fc)}</td>
+        <td class="ln">${ins.line}</td>
+      </tr>`;
+    }).join("");
+    document.getElementById("bc-constants").innerHTML = fc.constants.map((c, i) =>
+      `<span class="badge gray" style="font-family:var(--mono)">#${i} ${esc(typeof c === "string" ? '"' + c + '"' : String(c))}</span>`).join("") ||
+      '<span class="muted">（空常量池）</span>';
+  }
+
+  async function build() {
+    const code = editor.getValue();
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    if (!r.has_bytecode || !r.bytecode) {
+      document.getElementById("bc-fn-tabs").innerHTML = "";
+      document.getElementById("bc-body").innerHTML = "";
+      document.getElementById("bc-constants").innerHTML = "";
+      document.getElementById("bc-stats").innerHTML = `<span class="empty">🚫 无法生成字节码（编译未通过）· <a href="diagnostics.html">查看诊断</a></span>`;
+      return;
+    }
+    bc = r.bytecode;
+    curFn = 0;
+    document.getElementById("bc-stats").textContent =
+      `${bc.functions.length} 个代码段 · 共 ${bc.total_instructions} 条指令 · 全局变量 ${(bc.global_names || []).length} 个`;
+    renderTabs();
+    renderBody();
+  }
+
+  document.getElementById("btn-build").onclick = build;
+})();
+</script>
+</body>
+</html>

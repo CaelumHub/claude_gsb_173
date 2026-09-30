@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>调用栈与变量监视 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <button class="btn primary" id="btn-start">🐞 启动调试</button>
+          <button class="btn" id="btn-cont" disabled>▶ 继续</button>
+          <button class="btn" id="btn-stepin" disabled>单步(进入)</button>
+          <button class="btn" id="btn-stepover" disabled>单步(跳过)</button>
+          <button class="btn" id="btn-stepout" disabled>单步(跳出)</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+      <div id="cs-status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+
+      <div class="grid cols-2 mt">
+        <div class="card">
+          <h2>📚 调用栈（点击帧展开局部变量）</h2>
+          <div id="frames"></div>
+        </div>
+        <div class="card">
+          <h2>👁 变量监视</h2>
+          <div class="flex mb" style="gap:6px">
+            <input type="text" id="watch-input" placeholder="输入变量名，如 fib / n / a" style="flex:1">
+            <button class="btn" id="watch-add">＋ 监视</button>
+          </div>
+          <div id="watch-list"></div>
+          <h3>全局变量</h3>
+          <div id="globals"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("callstack");
+  ML.Shell.setTitle("调用栈与变量监视");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 340, breakpoints: true,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const esc = ML.escapeHtml;
+  const watchList = ML.store.get("watch_list", []);
+  let sid = null, lastState = null;
+
+  function setButtons(on) { ["btn-cont", "btn-stepin", "btn-stepover", "btn-stepout"].forEach((id) => document.getElementById(id).disabled = !on); }
+
+  function renderVarsTable(vars) {
+    const keys = Object.keys(vars || {});
+    if (!keys.length) return '<span class="muted" style="padding:4px 10px;display:inline-block">（无局部变量）</span>';
+    return `<table class="tbl var-table"><thead><tr><th>名称</th><th>值</th></tr></thead><tbody>` +
+      keys.map((k) => `<tr><td class="mono">${esc(k)}</td><td class="v">${ML.fmtVal(vars[k])}</td></tr>`).join("") + `</tbody></table>`;
+  }
+
+  function render(state) {
+    lastState = state;
+    const status = document.getElementById("cs-status");
+    if (!state.ok) {
+      if (state.compile_failed) { status.innerHTML = ML.badge("编译失败", "red"); setButtons(false); renderWatch(); return; }
+      status.innerHTML = ML.badge(state.error || "会话不可用", "red"); setButtons(false); renderWatch(); return;
+    }
+    if (state.not_started) { status.innerHTML = ML.badge("未启动", "gray"); setButtons(false); renderWatch(); return; }
+
+    const REASON = { breakpoint: ["断点", "red"], step: ["单步", "blue"], entry: ["启动", "purple"], finished: ["结束", "green"], error: ["出错", "red"] };
+    const [rl, rc] = REASON[state.reason] || [state.reason || "暂停", "gray"];
+    status.innerHTML = ML.badge("暂停：" + rl, rc) + ML.badge("帧数 " + (state.call_stack || []).length, "gray") +
+      ML.badge("指令 " + state.instruction_count, "gray") + (state.finished ? ML.badge("程序结束", "green") : "");
+
+    const line = state.next_instruction ? state.next_instruction.line : (state.current_position ? state.current_position[1] : null);
+    editor.setCurrentLine(line);
+
+    // 调用栈（帧可展开）
+    const frames = state.call_stack || [];
+    const fe = document.getElementById("frames");
+    if (!frames.length) fe.innerHTML = ML.empty("调用栈为空（程序已返回）");
+    else fe.innerHTML = `<div class="callstack">` + frames.map((f, i) => `
+      <div class="frame ${i === 0 ? "top" : ""}">
+        <div class="flex between" style="cursor:pointer" data-f="1">
+          <span><span class="fn">${esc(f.function)}</span><span class="ln">L${f.line}</span>${f.is_main ? ' <span class="badge gray">main</span>' : ""} ${i === 0 ? '<span class="badge cyan">当前帧</span>' : ""}</span>
+          <span class="muted" style="font-size:11px">ip=${f.ip} · ${Object.keys(f.locals || {}).length} 变量 ▾</span>
+        </div>
+        <div class="frame-locals" style="display:${i === 0 ? "block" : "none"};margin-top:8px">${renderVarsTable(f.locals)}</div>
+      </div>`).join("") + `</div>`;
+    fe.querySelectorAll("[data-f]").forEach((hdr) => {
+      hdr.onclick = () => { const box = hdr.nextElementSibling; box.style.display = box.style.display === "none" ? "block" : "none"; };
+    });
+
+    renderWatch();
+  }
+
+  function resolveWatch(name) {
+    if (!lastState) return undefined;
+    const frames = lastState.call_stack || [];
+    for (const f of frames) if (f.locals && name in f.locals) return { val: f.locals[name], frame: f.function };
+    if (lastState.globals && name in lastState.globals) return { val: lastState.globals[name], frame: "global" };
+    return undefined;
+  }
+
+  function renderWatch() {
+    const el = document.getElementById("watch-list");
+    if (!watchList.length) { el.innerHTML = ML.empty("添加变量名以监视其值在调试过程中的变化"); }
+    else el.innerHTML = watchList.map((name, idx) => {
+      const r = resolveWatch(name);
+      const valHtml = r === undefined ? '<span class="val-null">未定义</span>'
+        : ML.fmtVal(r.val) + ` <span class="badge gray" style="font-size:10px">${esc(r.frame)}</span>`;
+      return `<div class="flex between" style="padding:6px 8px;border-bottom:1px solid var(--border)">
+        <span class="mono" style="font-weight:600">${esc(name)}</span>
+        <span>${valHtml} <span class="x" data-del="${idx}" style="cursor:pointer;color:var(--text-faint)">✕</span></span>
+      </div>`;
+    }).join("");
+    el.querySelectorAll("[data-del]").forEach((x) => x.onclick = () => { watchList.splice(+x.dataset.del, 1); ML.store.set("watch_list", watchList); renderWatch(); });
+
+    // 全局变量
+    document.getElementById("globals").innerHTML = renderVarsTable(lastState && lastState.globals ? lastState.globals : {});
+  }
+
+  async function start() {
+    const data = await ML.api.debugStart(editor.getValue(), editor.getBreakpoints(), ML.Shell.getProjectId(), null);
+    if (data.ok && data.session_id) sid = data.session_id;
+    setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
+    render(data);
+  }
+  async function cmd(c) {
+    if (!sid) return;
+    const data = await ML.api.debugCommand(sid, c, editor.getBreakpoints());
+    setButtons(data.ok && !data.finished && !data.not_started && !data.compile_failed);
+    render(data);
+  }
+
+  document.getElementById("btn-start").onclick = start;
+  document.getElementById("btn-cont").onclick = () => cmd("continue_");
+  document.getElementById("btn-stepin").onclick = () => cmd("step_into");
+  document.getElementById("btn-stepover").onclick = () => cmd("step_over");
+  document.getElementById("btn-stepout").onclick = () => cmd("step_out");
+
+  document.getElementById("watch-add").onclick = () => {
+    const name = document.getElementById("watch-input").value.trim();
+    if (!name || !/^[A-Za-z_]\w*$/.test(name)) { ML.toast("请输入合法的标识符", "err"); return; }
+    if (!watchList.includes(name)) { watchList.push(name); ML.store.set("watch_list", watchList); }
+    document.getElementById("watch-input").value = "";
+    renderWatch();
+  };
+  document.getElementById("watch-input").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("watch-add").click(); });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+{
+  "diagnostics": [
+    {
+      "column": 14,
+      "end_column": 15,
+      "end_line": 5,
+      "fix": "将 '{' 替换为 )，或检查其前后是否缺少分隔符。",
+      "fix_hint": {
+        "action": "replace",
+        "end": 122,
+        "start": 121,
+        "text": ")"
+      },
+      "kind": "syntax",
+      "length": 1,
+      "line": 5,
+      "message": "意外的 token '{'，期望 )",
+      "phase": "parse",
+      "related": [],
+      "severity": "error"
+    },
+    {
+      "column": 1,
+      "end_column": 2,
+      "end_line": 7,
+      "fix": "将 '}' 替换为 ;，或检查其前后是否缺少分隔符。",
+      "fix_hint": {
+        "action": "replace",
+        "end": 170,
+        "start": 169,
+        "text": ";"
+      },
+      "kind": "syntax",
+      "length": 1,
+      "line": 7,
+      "message": "意外的 token '}'，期望 ;",
+      "phase": "parse",
+      "related": [],
+      "severity": "error"
+    }
+  ],
+  "stage": "parsed",
+  "success": false
+}

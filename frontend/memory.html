@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>内存模型可视化 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <button class="btn primary" id="btn-run">🧠 运行并快照内存</button>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="grid cols-3 mt" id="stats" style="display:none"></div>
+
+      <div class="grid cols-2 mt">
+        <div class="card">
+          <h2>📚 调用栈（局部变量与引用）</h2>
+          <div id="stack"></div>
+        </div>
+        <div class="card">
+          <h2>🧱 堆对象</h2>
+          <div id="heap"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>🔗 引用关系图</h2>
+        <div class="desc">每个堆对象指向它直接引用的对象（列表元素、函数绑定等）。</div>
+        <div id="refs"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("memory");
+  ML.Shell.setTitle("内存模型可视化");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 260,
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[+sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const esc = ML.escapeHtml;
+  const KIND_CLS = { list: "list", function: "function", string: "string" };
+
+  function fmtCell(v) {
+    if (v == null) return '<span class="val-null">null</span>';
+    if (typeof v === "string") return `<span class="val-str">"${esc(v)}"</span>`;
+    if (v.kind === "list") return `<span class="val-list">list#${v.oid} (${v.len})</span>`;
+    if (v.kind === "string") return `<span class="val-str">"${esc(v.value)}"</span>`;
+    return ML.fmtVal(v);
+  }
+
+  function render(mem) {
+    document.getElementById("stats").style.display = "grid";
+    const s = mem.stats || {};
+    document.getElementById("stats").innerHTML =
+      `<div class="stat-tile"><div class="v">${s.object_count ?? 0}</div><div class="k">存活对象</div></div>` +
+      `<div class="stat-tile"><div class="v">${ML.fmtBytes(s.total_bytes)}</div><div class="k">总占用（近似）</div></div>` +
+      `<div class="stat-tile"><div class="v">${s.peak_objects ?? 0}</div><div class="k">峰值对象数</div></div>`;
+
+    // 调用栈
+    const stack = mem.stack || [];
+    const st = document.getElementById("stack");
+    if (!stack.length) st.innerHTML = ML.empty("调用栈为空");
+    else st.innerHTML = `<div class="mem-stack">` + stack.map((f) => `
+      <div class="frame">
+        <div class="fn">${esc(f.function)} · L${f.line}</div>
+        <div class="vars">${(f.locals || []).length ? f.locals.map((l) => `
+          <div class="mem-cell ${l.ref ? "ref" : ""}">
+            <span class="nm">${esc(l.name)}</span>
+            <span class="vl">${fmtCell(l.value)}</span>
+            ${l.ref ? `<span class="nm">→ #${l.ref}</span>` : ""}
+          </div>`).join("") : '<span class="muted" style="padding:6px">（无局部变量）</span>'}</div>
+      </div>`).join("") + `</div>`;
+
+    // 堆对象
+    const objs = mem.objects || [];
+    const byId = {};
+    objs.forEach((o) => byId[o.oid] = o);
+    const heap = document.getElementById("heap");
+    if (!objs.length) heap.innerHTML = ML.empty("堆为空（没有分配列表/字符串/函数对象）");
+    else heap.innerHTML = `<div class="mem-heap">` + objs.map((o) => {
+      const refs = (o.refs || []).map((r) => byId[r] ? `<span class="badge gray" style="font-family:var(--mono)">#${r} ${esc(byId[r].kind)}</span>` : `#${r}`).join(" ");
+      return `<div class="heap-obj ${KIND_CLS[o.kind] || ""}">
+        <div class="id">#${o.oid} <span class="badge ${o.kind === "list" ? "cyan" : o.kind === "function" ? "purple" : "green"}">${esc(o.kind)}</span></div>
+        <div class="rep">${esc(o.repr || "")}</div>
+        <div class="sz">${ML.fmtBytes(o.size)}</div>
+        ${refs ? `<div class="refs">引用 → ${refs}</div>` : ""}
+      </div>`;
+    }).join("") + `</div>`;
+
+    // 引用关系
+    const re = document.getElementById("refs");
+    const edges = [];
+    objs.forEach((o) => (o.refs || []).forEach((r) => edges.push([o.oid, r])));
+    if (!edges.length) re.innerHTML = ML.empty("无引用关系");
+    else re.innerHTML = `<table class="tbl"><thead><tr><th>来源</th><th>目标</th><th>目标内容</th></tr></thead><tbody>` +
+      edges.map(([a, b]) => `<tr><td class="mono">#${a}</td><td class="mono">#${b}</td><td>${esc(byId[b] ? byId[b].repr : "")}</td></tr>`).join("") + `</tbody></table>`;
+  }
+
+  async function run() {
+    const code = editor.getValue();
+    const data = await ML.api.run(code, { memory: true });
+    const r = data.result || {};
+    if (!r.ok) {
+      document.getElementById("stack").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
+      document.getElementById("heap").innerHTML = "";
+      document.getElementById("refs").innerHTML = "";
+      document.getElementById("stats").style.display = "none";
+      ML.toast("编译失败，无法运行", "err");
+      return;
+    }
+    if (r.error) {
+      ML.toast("运行时出错，仍展示错误发生时刻的内存快照", "err");
+    }
+    render(r.memory || { objects: [], stack: [], stats: {} });
+  }
+
+  document.getElementById("btn-run").onclick = run;
+})();
+</script>
+</body>
+</html>

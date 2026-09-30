@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AST 语法树可视化 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <button class="btn" id="btn-expand">展开全部</button>
+          <button class="btn" id="btn-collapse">折叠全部</button>
+          <button class="btn primary" id="btn-build">🌳 编译生成 AST</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+
+      <div class="card mt">
+        <div class="flex between">
+          <h2>抽象语法树（AST）</h2>
+          <div id="ast-stats" class="muted" style="font-size:12px"></div>
+        </div>
+        <div class="desc">点击节点可展开 / 折叠子树。AST 是编译器前端词法 → 语法分析的核心中间产物，后续语义分析与字节码生成都基于它。</div>
+        <div id="ast" class="ast-tree" style="overflow:auto"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("ast");
+  ML.Shell.setTitle("AST 语法树可视化");
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 240,
+  });
+
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${ML.escapeHtml(s.name)}</option>`).join("");
+  sampleSel.onchange = () => {
+    if (sampleSel.value === "") return;
+    editor.setValue(ML.SAMPLES[parseInt(sampleSel.value, 10)].code);
+    sampleSel.value = "";
+  };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  const esc = ML.escapeHtml;
+
+  function astChildren(node) {
+    const t = node.type, kids = [];
+    if (t === "IfBranch") { kids.push(["condition", node.condition], ["body", node.body]); }
+    else if (t === "ElseBranch") { kids.push(["body", node.body]); }
+    else if (t === "ForInit") { kids.push(["init", node.stmt]); }
+    else if (t === "ForCondition") { if (node.condition) kids.push(["condition", node.condition]); }
+    else if (t === "ForIncrement") { kids.push(["increment", node.expr]); }
+    else if (t === "CallExpr") { kids.push(["callee", node.callee]); (node.children || []).forEach((c) => kids.push(["arg", c])); }
+    else if (Array.isArray(node.children)) { node.children.forEach((c) => kids.push([null, c])); }
+    return kids;
+  }
+
+  function nodeLabel(node) {
+    const t = node.type;
+    if (t === "NumberLiteral") return `${node.value} <span class="badge cyan">${esc(node.kind)}</span>`;
+    if (t === "StringLiteral") return `"${esc(node.value)}"`;
+    if (t === "BoolLiteral") return String(node.value);
+    if (t === "NullLiteral") return "null";
+    if (t === "Identifier") return esc(node.name) + (node.resolved ? ` <span class="badge purple">→ ${esc(node.resolved)}</span>` : "");
+    if (t === "VarDecl") return esc(node.name) + (node.is_const ? " <span class=\"badge gray\">const</span>" : "");
+    if (t === "AssignStmt") return esc(node.op);
+    if (t === "UnaryExpr" || t === "BinaryExpr" || t === "LogicalExpr") return esc(node.op);
+    if (t === "FunctionDecl") return `${esc(node.name)}(${(node.params || []).map(esc).join(", ")})`;
+    if (t === "ListLiteral") return `[${(node.children || []).length} 项]`;
+    return "";
+  }
+
+  let nodeCount = 0, maxDepth = 0;
+  function nodeHtml(node, depth) {
+    nodeCount++;
+    maxDepth = Math.max(maxDepth, depth);
+    const kids = astChildren(node);
+    const hasKids = kids.length > 0;
+    const label = nodeLabel(node);
+    const type = (node.static_type && node.static_type !== "unknown" && node.static_type !== "void")
+      ? `<span class="badge cyan" style="font-size:10px">${esc(node.static_type)}</span>` : "";
+    let html = `<li class="ast-node ${hasKids ? "" : "leaf"}">`;
+    html += `<div class="n"${hasKids ? ' data-toggle="1"' : ""}><span class="tgl">${hasKids ? "▼" : "·"}</span>` +
+      `<span class="tag">${esc(node.type)}</span>${type}` +
+      (label ? `<span class="val">${label}</span>` : "") +
+      `<span class="ln">@L${node.line}</span></div>`;
+    if (hasKids) {
+      html += `<ul>`;
+      for (const [lbl, child] of kids) {
+        if (child == null) continue;
+        if (lbl) {
+          html += `<li class="ast-node"><div class="n"><span class="tgl"> </span><span class="tag" style="color:var(--text-muted)">${esc(lbl)}</span></div><ul>${nodeHtml(child, depth + 1)}</ul></li>`;
+        } else {
+          html += nodeHtml(child, depth + 1);
+        }
+      }
+      html += `</ul>`;
+    }
+    return html + `</li>`;
+  }
+
+  async function build() {
+    const code = editor.getValue();
+    const data = await ML.api.compile(code);
+    const r = data.result || {};
+    const out = document.getElementById("ast");
+    if (!r.has_ast || !r.ast) {
+      out.innerHTML = `<div class="empty"><div class="big">🚫</div>无法生成 AST（编译未通过）。<br><a href="diagnostics.html">前往诊断页查看错误</a></div>`;
+      document.getElementById("ast-stats").textContent = "";
+      return;
+    }
+    nodeCount = 0; maxDepth = 0;
+    out.innerHTML = `<ul>${nodeHtml(r.ast, 0)}</ul>`;
+    document.getElementById("ast-stats").textContent = `${nodeCount} 个节点 · 最大深度 ${maxDepth}`;
+    bindToggle();
+  }
+
+  function bindToggle() {
+    document.getElementById("ast").querySelectorAll(".n[data-toggle]").forEach((n) => {
+      n.addEventListener("click", () => {
+        const ul = n.nextElementSibling;
+        if (!ul) return;
+        const hidden = ul.style.display === "none";
+        ul.style.display = hidden ? "" : "none";
+        n.querySelector(".tgl").textContent = hidden ? "▼" : "▶";
+      });
+    });
+  }
+
+  function setAll(show) {
+    document.getElementById("ast").querySelectorAll(".n[data-toggle]").forEach((n) => {
+      const ul = n.nextElementSibling;
+      if (ul) { ul.style.display = show ? "" : "none"; n.querySelector(".tgl").textContent = show ? "▼" : "▶"; }
+    });
+  }
+
+  document.getElementById("btn-build").onclick = build;
+  document.getElementById("btn-expand").onclick = () => setAll(true);
+  document.getElementById("btn-collapse").onclick = () => setAll(false);
+})();
+</script>
+</body>
+</html>

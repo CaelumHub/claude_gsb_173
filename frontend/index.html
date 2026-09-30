@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>项目管理与历史 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex between mb">
+        <div>
+          <h1 style="font-size:18px;font-weight:650">我的项目</h1>
+          <div class="muted" style="font-size:12.5px">项目、源码与运行记录以 JSON 文件按项目/版本分目录存储，写入采用文件锁 + 原子写</div>
+        </div>
+        <button class="btn primary" id="btn-new">＋ 新建项目</button>
+      </div>
+
+      <div id="proj-list" class="grid cols-3"></div>
+
+      <div id="detail" style="display:none" class="mt">
+        <div class="card">
+          <div class="flex between" style="align-items:flex-start">
+            <div>
+              <h2 id="d-name" style="font-size:18px;margin-bottom:4px"></h2>
+              <div class="muted" id="d-meta" style="font-size:12.5px"></div>
+            </div>
+            <div class="flex">
+              <button class="btn sm" id="btn-rename">✏️ 重命名</button>
+              <button class="btn sm" id="btn-open-editor">打开编辑器</button>
+              <button class="btn sm danger" id="btn-del">🗑 删除</button>
+            </div>
+          </div>
+          <div class="mt">
+            <h3>历史版本</h3>
+            <div id="ver-list"></div>
+          </div>
+          <div class="mt">
+            <h3>版本对比</h3>
+            <div class="flex wrap" style="gap:8px">
+              <select id="diff-a" class="diff-sel" style="min-width:180px"></select>
+              <span class="muted">vs</span>
+              <select id="diff-b" class="diff-sel" style="min-width:180px"></select>
+              <button class="btn sm" id="btn-diff">对比</button>
+            </div>
+            <div id="diff-out" class="mt" style="overflow:auto;max-height:360px;background:var(--surface-2);border-radius:var(--radius);padding:8px 0"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 新建项目 / 查看源码 模态框 -->
+<div class="modal-backdrop" id="modal">
+  <div class="modal">
+    <div class="m-head"><span id="modal-title">新建项目</span><span class="x" id="modal-x">✕</span></div>
+    <div class="m-body">
+      <div class="field" id="modal-name-field">
+        <label>项目名称</label>
+        <input type="text" id="modal-name" placeholder="例如：冒泡排序练习">
+      </div>
+      <div class="field">
+        <label id="modal-src-label">初始源码</label>
+        <textarea id="modal-src" spellcheck="false"></textarea>
+      </div>
+    </div>
+    <div class="m-foot">
+      <button class="btn" id="modal-cancel">取消</button>
+      <button class="btn primary" id="modal-ok">创建</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/common.js"></script>
+<script>
+(function () {
+  ML.Shell.render("index");
+  let projects = [];
+  let current = null;       // 当前选中的项目
+  let modalMode = "new";    // new | view
+
+  const $ = (id) => document.getElementById(id);
+
+  /* ---------- 项目列表 ---------- */
+  async function loadProjects() {
+    const data = await ML.api.listProjects();
+    projects = data.projects || [];
+    renderProjects();
+  }
+
+  function renderProjects() {
+    const el = $("proj-list");
+    if (!projects.length) {
+      el.innerHTML = `<div style="grid-column:1/-1">${ML.empty("还没有项目，点击右上角「新建项目」开始")}</div>`;
+      return;
+    }
+    el.innerHTML = projects.map((p) => `
+      <div class="proj-card" data-id="${p.id}">
+        <div class="t">${ML.escapeHtml(p.name)}</div>
+        <div class="m">${ML.escapeHtml(p.description || "暂无描述")}</div>
+        <div class="mets">
+          <span>📦 ${p.version_count} 版本</span>
+          <span>🕒 ${ML.escapeHtml(p.updated_at)}</span>
+          <span>🔤 ${ML.escapeHtml(p.language)}</span>
+        </div>
+      </div>`).join("");
+    el.querySelectorAll(".proj-card").forEach((c) => {
+      c.addEventListener("click", () => selectProject(c.dataset.id));
+    });
+  }
+
+  /* ---------- 选中项目 / 详情 ---------- */
+  async function selectProject(id) {
+    const data = await ML.api.getProject(id);
+    if (!data.ok || !data.project) return;
+    current = data.project;
+    ML.store.set("project_id", id);
+    if (ML.Shell.onProjectChange) ML.Shell.onProjectChange(id);
+    renderDetail();
+    await loadVersions();
+  }
+
+  function renderDetail() {
+    $("detail").style.display = "block";
+    $("d-name").textContent = current.name;
+    $("d-meta").innerHTML =
+      `创建于 ${ML.escapeHtml(current.created_at)} · 更新于 ${ML.escapeHtml(current.updated_at)} · ` +
+      `<code>${ML.escapeHtml(current.id)}</code>`;
+  }
+
+  async function loadVersions() {
+    const data = await ML.api.listVersions(current.id);
+    const vers = data.versions || [];
+    const el = $("ver-list");
+    if (!vers.length) {
+      el.innerHTML = ML.empty("暂无版本");
+    } else {
+      el.innerHTML = vers.map((v) => `
+        <div class="ver-row" data-vid="${v.id}">
+          <div class="dot ${v.compiled_ok ? "" : "bad"}" title="${v.compiled_ok ? "编译通过" : "存在编译错误"}"></div>
+          <div class="info">
+            <div class="msg">${ML.escapeHtml(v.message)}</div>
+            <div class="meta">${ML.escapeHtml(v.created_at)} · ${v.line_count} 行 · ${v.source_len} 字符 · ${v.error_count} 错误 · <code>${v.id.slice(0, 8)}</code></div>
+          </div>
+          <div class="actions">
+            <button class="btn sm" data-a="view">查看</button>
+            <button class="btn sm" data-a="restore">恢复</button>
+            <button class="btn sm" data-a="diffa">设为 A</button>
+            <button class="btn sm" data-a="diffb">设为 B</button>
+          </div>
+        </div>`).join("");
+      el.querySelectorAll(".ver-row").forEach((row) => {
+        const vid = row.dataset.vid;
+        row.querySelector('[data-a="view"]').onclick = () => viewVersion(vid);
+        row.querySelector('[data-a="restore"]').onclick = () => restoreVersion(vid);
+        row.querySelector('[data-a="diffa"]').onclick = () => { $("diff-a").value = vid; };
+        row.querySelector('[data-a="diffb"]').onclick = () => { $("diff-b").value = vid; };
+      });
+    }
+    // 填充 diff 下拉
+    const opts = vers.map((v) => `<option value="${v.id}">${ML.escapeHtml(v.message)}（${v.id.slice(0, 6)}）</option>`).join("");
+    $("diff-a").innerHTML = opts;
+    $("diff-b").innerHTML = opts;
+    if (vers.length >= 2) {
+      $("diff-a").value = vers[1].id;
+      $("diff-b").value = vers[0].id;
+    }
+  }
+
+  async function viewVersion(vid) {
+    const data = await ML.api.getVersion(current.id, vid);
+    if (!data.ok || !data.version) return;
+    openModal("view", "查看源码：" + (data.version.manifest.message || ""), data.version.source, true);
+  }
+
+  async function restoreVersion(vid) {
+    if (!confirm("恢复该版本？将生成一个新版本保存当前源码。")) return;
+    const data = await ML.api.restoreVersion(current.id, vid);
+    if (data.ok) { ML.toast("已恢复到该版本", "ok"); await loadVersions(); }
+  }
+
+  async function doDiff() {
+    const a = $("diff-a").value, b = $("diff-b").value;
+    if (!a || !b) { ML.toast("请选择两个版本", "err"); return; }
+    const data = await ML.api.diffVersions(current.id, a, b);
+    const diff = data.diff || [];
+    const out = $("diff-out");
+    if (!diff.length) { out.innerHTML = ML.empty("两个版本内容完全一致"); return; }
+    let html = "";
+    for (const hunk of diff) {
+      for (const line of hunk.old_lines || []) {
+        html += `<div class="diff-line del"><span class="mark">-</span>${ML.escapeHtml(line)}</div>`;
+      }
+      for (const line of hunk.new_lines || []) {
+        html += `<div class="diff-line add"><span class="mark">+</span>${ML.escapeHtml(line)}</div>`;
+      }
+    }
+    out.innerHTML = html || ML.empty("无差异");
+  }
+
+  /* ---------- 模态框 ---------- */
+  function openModal(mode, title, source, readOnly) {
+    modalMode = mode;
+    $("modal-title").textContent = title;
+    $("modal-src").value = source || "";
+    $("modal-src").readOnly = !!readOnly;
+    $("modal-name-field").style.display = mode === "new" ? "" : "none";
+    $("modal-ok").textContent = mode === "new" ? "创建" : "关闭";
+    $("modal").classList.add("open");
+  }
+  function closeModal() { $("modal").classList.remove("open"); }
+
+  async function createProject() {
+    const name = $("modal-name").value.trim();
+    if (!name) { ML.toast("请输入项目名称", "err"); return; }
+    const source = $("modal-src").value;
+    const data = await ML.api.createProject(name, source);
+    if (data.ok) {
+      ML.toast("项目已创建", "ok");
+      closeModal();
+      await loadProjects();
+      await selectProject(data.project.id);
+    } else {
+      ML.toast(data.error || "创建失败", "err");
+    }
+  }
+
+  /* ---------- 事件绑定 ---------- */
+  $("btn-new").onclick = () => {
+    $("modal-name").value = "";
+    $("modal-src").value = ML.DEFAULT_CODE;
+    openModal("new", "新建项目", ML.DEFAULT_CODE, false);
+  };
+  $("modal-x").onclick = closeModal;
+  $("modal-cancel").onclick = closeModal;
+  $("modal").addEventListener("click", (e) => { if (e.target === $("modal")) closeModal(); });
+  $("modal-ok").onclick = () => {
+    if (modalMode === "new") createProject(); else closeModal();
+  };
+  $("btn-diff").onclick = doDiff;
+  $("btn-open-editor").onclick = () => location.href = "editor.html";
+  $("btn-rename").onclick = async () => {
+    const name = prompt("新名称：", current.name);
+    if (!name) return;
+    await ML.api.updateProject(current.id, { name });
+    await loadProjects();
+    await selectProject(current.id);
+  };
+  $("btn-del").onclick = async () => {
+    if (!confirm(`确认删除项目「${current.name}」？该操作不可撤销。`)) return;
+    await ML.api.deleteProject(current.id);
+    ML.toast("项目已删除", "ok");
+    current = null;
+    $("detail").style.display = "none";
+    await loadProjects();
+  };
+
+  loadProjects();
+})();
+</script>
+</body>
+</html>

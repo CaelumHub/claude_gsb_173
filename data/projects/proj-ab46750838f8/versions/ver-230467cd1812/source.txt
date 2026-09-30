@@ -1,0 +1,15 @@
+// 递归计算斐波那契数列（演示调用栈 / 断点 / 单步）
+func fib(n) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+func main_program() {
+    for (var i = 0; i < 12; i = i + 1) {
+        print("fib(", i, ") =", fib(i));
+    }
+}
+
+main_program();
