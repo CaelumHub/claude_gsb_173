@@ -172,7 +172,7 @@ code, pre, .mono { font-family: var(--mono); }
 .grid { display: grid; gap: 16px; }
 .grid.cols-2 { grid-template-columns: 1fr 1fr; }
 .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
-@media (max-width: 900px) { .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .grid.cols-2, .grid.cols-3, .run-grid { grid-template-columns: 1fr; } }
 
 /* ---------- 表格 ---------- */
 table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -427,6 +427,17 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .output-console { background: #0d1117; color: #e6edf3; font-family: var(--mono); font-size: 13px; border-radius: var(--radius); padding: 14px; min-height: 120px; max-height: 320px; overflow: auto; white-space: pre-wrap; }
 .output-console .ln-err { color: #f85149; }
 .output-console .ln-out { color: #a5d6ff; }
+.stdin-toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+.stdin-toolbar input[type="text"] { flex: 1; min-width: 0; font-family: var(--mono); }
+.stdin-hint { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 12px; }
+.stdin-queue { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); min-height: 128px; max-height: 260px; overflow: auto; }
+.stdin-queue .empty-inputs { padding: 18px 10px; text-align: center; font-size: 12.5px; }
+.stdin-item { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 12.5px; }
+.stdin-item:last-child { border-bottom: none; }
+.stdin-item .idx { color: var(--text-faint); text-align: right; }
+.stdin-item .val { overflow-wrap: anywhere; color: var(--text); }
+.stdin-item .val em { color: var(--text-faint); font-family: var(--sans); }
+.stdin-item .tag { color: var(--text-faint); font-size: 11px; font-family: var(--sans); }
 input[type="text"], input[type="number"], select, textarea.plain {
   font-family: inherit; font-size: 13px; padding: 7px 10px;
   border: 1px solid var(--border-strong); border-radius: var(--radius-sm);

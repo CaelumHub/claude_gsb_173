@@ -142,6 +142,20 @@
     // ---- 编译 / 运行 ----
     compile(source, detail) { return this.post("/api/compile", { source, detail: detail || "all" }); },
     run(source, options) { return this.post("/api/run", { source, options: options || {} }); },
+    runProject(pid, versionId, source, options) {
+      return this.post(`/api/projects/${pid}/run`, {
+        version_id: versionId || null, source, options: options || {},
+      });
+    },
+    runInteractive(source, options, pid, vid) {
+      return this.post("/api/runs/interactive", {
+        source, options: options || {}, project_id: pid || null, version_id: vid || null,
+      });
+    },
+    runState(sid) { return this.get(`/api/runs/interactive/${sid}/state`); },
+    runInput(sid, inputs) { return this.post(`/api/runs/interactive/${sid}/input`, { inputs }); },
+    runEof(sid) { return this.post(`/api/runs/interactive/${sid}/eof`, {}); },
+    runStop(sid) { return this.post(`/api/runs/interactive/${sid}/stop`, {}); },
 
     // ---- 调试 ----
     debugStart(source, breakpoints, pid, vid) { return this.post("/api/debug/start", { source, breakpoints: breakpoints || [], project_id: pid, version_id: vid }); },

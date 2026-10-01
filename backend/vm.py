@@ -76,6 +76,11 @@ class VM:
         self.error: Optional[diag.Diagnostic] = None
         self.output: List[str] = []
         self.input_queue: List[str] = []
+        self.input_reader = None
+        self.input_requests = 0
+        self.inputs_consumed = 0
+        self.input_underflow = 0
+        self.input_eof = False
         self.return_value = None
         self.profiler = None
         self.debugger = None
@@ -624,9 +629,18 @@ class VM:
         return round(args[0], 1)
 
     def _bi_input(self, args):
-        if self.input_queue:
-            return self.input_queue.pop(0)
-        return ""
+        self.input_requests += 1
+        if self.input_reader is not None:
+            value = self.input_reader()
+            if getattr(self, "input_eof", False):
+                self.input_underflow += 1
+        elif self.input_queue:
+            value = self.input_queue.pop(0)
+        else:
+            self.input_underflow += 1
+            value = ""
+        self.inputs_consumed += 1
+        return value
 
     def _bi_time(self, args):
         return time.time()

@@ -57,6 +57,21 @@ def _read_body(handler) -> dict:
         return {}
 
 
+def _normalize_run_options(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    opts = dict(value)
+    if isinstance(opts.get("inputs"), str):
+        opts["inputs"] = opts["inputs"].splitlines()
+    elif isinstance(opts.get("inputs"), list):
+        opts["inputs"] = ["" if item is None else str(item) for item in opts["inputs"]]
+    elif "inputs" in opts and opts["inputs"] is not None:
+        opts["inputs"] = [str(opts["inputs"])]
+    if isinstance(opts.get("sample_interval_ms"), (int, float)):
+        opts["sample_interval_ms"] = int(opts["sample_interval_ms"])
+    return opts
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MiniLangPlatform/1.0"
 
@@ -132,8 +147,9 @@ class Handler(BaseHTTPRequestHandler):
 
         m = re.match(r"^/api/projects/([^/]+)/run$", path)
         if m and method == "POST":
+            opts = _normalize_run_options(body.get("options", {}))
             rec = svc.record_run(m.group(1), body.get("version_id"), body.get("source", ""),
-                                 body.get("options", {}))
+                                 opts)
             return self._json(200, {"ok": True, "run": rec})
 
         m = re.match(r"^/api/projects/([^/]+)$", path)
@@ -152,11 +168,28 @@ class Handler(BaseHTTPRequestHandler):
             view = svc.compile_view(body.get("source", ""), body.get("detail", "all"))
             return self._json(200, {"ok": True, "result": view})
         if path == "/api/run" and method == "POST":
-            opts = body.get("options", {})
-            if isinstance(opts, dict) and isinstance(opts.get("sample_interval_ms"), (int, float)):
-                opts["sample_interval_ms"] = int(opts["sample_interval_ms"])
+            opts = _normalize_run_options(body.get("options", {}))
             out = svc.run(body.get("source", ""), opts)
             return self._json(200, {"ok": True, "result": out})
+        if path == "/api/runs/interactive" and method == "POST":
+            opts = _normalize_run_options(body.get("options", {}))
+            state = svc.run_start(body.get("source", ""), opts,
+                                  body.get("project_id"), body.get("version_id"))
+            return self._json(200, state)
+
+        m = re.match(r"^/api/runs/interactive/([^/]+)/state$", path)
+        if m and method == "GET":
+            return self._json(200, svc.run_session_state(m.group(1)))
+        m = re.match(r"^/api/runs/interactive/([^/]+)/input$", path)
+        if m and method == "POST":
+            value = body.get("inputs", body.get("input", ""))
+            return self._json(200, svc.run_session_input(m.group(1), value))
+        m = re.match(r"^/api/runs/interactive/([^/]+)/eof$", path)
+        if m and method == "POST":
+            return self._json(200, svc.run_session_eof(m.group(1)))
+        m = re.match(r"^/api/runs/interactive/([^/]+)/stop$", path)
+        if m and method == "POST":
+            return self._json(200, svc.run_session_stop(m.group(1)))
 
         # ---- 调试 ----
         if path == "/api/debug/start" and method == "POST":

@@ -13,6 +13,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from . import compiler
+from . import service
 from . import vm as vm_mod
 from . import debugger as debugger_mod
 from . import profiler as profiler_mod
@@ -49,6 +50,7 @@ def run_all():
     _test_functions_recursion()
     _test_control_flow()
     _test_lists()
+    _test_input_queue()
     _test_runtime_errors()
     _test_debugger()
     _test_profiler()
@@ -134,6 +136,30 @@ def _test_lists():
     out = _run(src)
     ok = out.get("ok") and out["output"] == ["4 99 4"]
     _check("解释器：列表构建/下标/len/push", ok, str(out.get("output")))
+
+
+def _test_input_queue():
+    import time
+    src = ("var a = input();\n"
+           "var b = input();\n"
+           "print(a);\n"
+           "print(b);")
+    out = _run(src, inputs=["Alice", "42"])
+    ok = out.get("ok") and out.get("output") == ["Alice", "42"] \
+        and out.get("input_requests") == 2 and out.get("inputs_consumed") == 2
+    _check("解释器：input 按顺序逐条消费输入", ok, str(out.get("output")))
+
+    svc = service.Service()
+    state = svc.run_start(src, {"inputs": ["one"]})
+    sid = state["session_id"]
+    ok_waiting = state.get("waiting_input") is True and state.get("inputs_consumed") == 1
+    state2 = svc.run_session_input(sid, "two")
+    time.sleep(0.05)
+    state3 = svc.run_session_state(sid)
+    ok_interactive = (ok_waiting and state2.get("accepted") == 1
+                      and state3.get("finished") and state3.get("output") == ["one", "two"]
+                      and state3.get("inputs_consumed") == 2)
+    _check("解释器：交互式运行中追加 input 输入", ok_interactive, str(state3))
 
 
 def _test_runtime_errors():

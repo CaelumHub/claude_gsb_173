@@ -5,7 +5,8 @@
 职责划分：
   * 项目管理与历史版本（创建/列表/重命名/删除/保存版本/恢复/对比）；
   * 编译流水线（带产物缓存）；
-  * 普通运行（可选性能剖析）；
+  * 普通运行（同步队列输入，可选性能剖析）；
+  * 交互式运行会话（input() 等待，输入跨 HTTP 请求追加）；
   * 交互式调试会话（断点/单步/续跑，会话状态驻留内存，支持跨请求同步）；
   * 内存快照（运行/调试暂停时产出）。
 
@@ -15,9 +16,11 @@
 import os
 import shutil
 import time
+import queue
 import difflib
 import hashlib
-from typing import Dict, List, Optional
+import threading
+from typing import Dict, List, Optional, Any
 
 from . import config
 from . import storage
@@ -27,6 +30,7 @@ from . import debugger as debugger_mod
 from . import profiler as profiler_mod
 from . import diagnostics as diag
 from . import memory_model
+from . import runtime as rt
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +73,21 @@ def _hash(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_inputs(value):
+    """把接口传入的预填输入规范成字符串列表。
+
+    前端默认逐行填写，因此字符串会按换行拆成多条；数组中的每个元素就是一次
+    ``input()`` 调用的返回值，空字符串也会保留，不会被过滤。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return value.splitlines()
+    if isinstance(value, (list, tuple)):
+        return ["" if item is None else str(item) for item in value]
+    return [str(value)]
+
+
 def _diff_lines(a: str, b: str) -> List[dict]:
     """行级 diff，返回结构化结果供前端渲染。"""
     al = a.splitlines()
@@ -95,7 +114,10 @@ class Service:
     def __init__(self):
         config.ensure_dirs()
         self.debug_sessions: Dict[str, "DebugSession"] = {}
+        self.run_sessions: Dict[str, "RunSession"] = {}
         self._session_counter = 0
+        self._run_session_counter = 0
+        self._run_sessions_lock = threading.Lock()
 
     # ==================================================================
     # 项目管理
@@ -270,8 +292,9 @@ class Service:
             vm.profiler = prof
             if options.get("sample", True):
                 prof.start_sampling(float(options.get("sample_interval_ms", 1.0)))
-        if options.get("inputs"):
-            vm.input_queue = list(options["inputs"])
+        inputs = _normalize_inputs(options.get("inputs"))
+        if inputs:
+            vm.input_queue = list(inputs)
         vm.start()
         vm.run()
         if prof:
@@ -284,8 +307,11 @@ class Service:
         out = {
             "ok": True,
             "output": list(vm.output),
-            "return_value": vm.return_value,
+            "return_value": _json_value(vm.return_value),
             "error": vm.error.to_dict() if vm.error else None,
+            "input_requests": vm.input_requests,
+            "inputs_consumed": vm.inputs_consumed,
+            "input_underflow": vm.input_underflow,
             "instruction_count": vm.instruction_count,
             "elapsed_ms": round(vm.elapsed_ms(), 3),
             "profile": report,
@@ -306,25 +332,91 @@ class Service:
             "output": out.get("output", []),
             "return_value": out.get("return_value"),
             "instruction_count": out.get("instruction_count", 0),
+            "input_requests": out.get("input_requests", 0),
+            "inputs_consumed": out.get("inputs_consumed", 0),
+            "input_underflow": out.get("input_underflow", 0),
+            "inputs": _normalize_inputs(options.get("inputs")),
             "error": out.get("error"),
             "profiled": bool(out.get("profile")),
         }
         if pid and vid:
-            vdir = storage.version_dir(pid, vid)
-            run_path = os.path.join(vdir, "run.json")
-            def _mut(data):
-                data = data if isinstance(data, list) else []
-                data.append(rec)
-                if len(data) > 200:
-                    data = data[-200:]
-                return data, True
-            storage.update_json(run_path, _mut)
-        # 全局运行记录索引
+            self._persist_run_record(pid, vid, rec)
+        return self._write_global_run_record(pid, vid, rec)
+        return rec
+
+    def _persist_run_record(self, pid, vid, rec):
+        vdir = storage.version_dir(pid, vid)
+        run_path = os.path.join(vdir, "run.json")
+
+        def _mut(data):
+            data = data if isinstance(data, list) else []
+            data.append(rec)
+            if len(data) > 200:
+                data = data[-200:]
+            return data, True
+
+        storage.update_json(run_path, _mut)
+
+    def _write_global_run_record(self, pid, vid, rec):
         global_rec = dict(rec)
         global_rec["project_id"] = pid
         global_rec["version_id"] = vid
         storage.write_json(os.path.join(config.RUNS_DIR, rec["id"] + ".json"), global_rec)
         return rec
+
+    # ==================================================================
+    # 交互式运行会话
+    # ==================================================================
+    def _new_run_session_id(self):
+        self._run_session_counter += 1
+        return f"run-{self._run_session_counter:x}-{int(time.time() * 1000) % 100000:x}"
+
+    def _prune_run_sessions_locked(self):
+        """仅保留最近的完成会话；等待输入的活跃会话不会被清理。"""
+        finished = [s for s in self.run_sessions.values() if s.finished]
+        for sess in sorted(finished, key=lambda s: s.started_at, reverse=True)[20:]:
+            self.run_sessions.pop(sess.id, None)
+
+    def run_start(self, source, options=None, pid=None, vid=None):
+        """启动一个可在运行中追加 stdin 的后台运行会话。"""
+        options = options or {}
+        initial_inputs = _normalize_inputs(options.get("inputs"))
+        if sum(len(item) for item in initial_inputs) > 1_000_000:
+            return {"ok": False, "error": "预填输入总长度超过 1MB 上限"}
+        options["inputs"] = initial_inputs
+        sid = self._new_run_session_id()
+        sess = RunSession(sid, source, options or {}, pid, vid, self)
+        with self._run_sessions_lock:
+            self._prune_run_sessions_locked()
+            self.run_sessions[sid] = sess
+        sess.start()
+        return sess.state()
+
+    def run_session_state(self, sid):
+        sess = self.run_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "运行会话不存在或已结束", "session_id": sid}
+        return sess.state()
+
+    def run_session_input(self, sid, value):
+        sess = self.run_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "运行会话不存在或已结束", "session_id": sid}
+        return sess.send_inputs(value)
+
+    def run_session_eof(self, sid):
+        sess = self.run_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "运行会话不存在或已结束", "session_id": sid}
+        return sess.send_eof()
+
+    def run_session_stop(self, sid):
+        sess = self.run_sessions.get(sid)
+        if not sess:
+            return {"ok": True, "removed": False}
+        # 向 input() 发送 EOF；不删除会话，前端仍可读取最终输出与诊断。
+        sess.stop()
+        return {"ok": True, "removed": False}
 
     # ==================================================================
     # 调试会话
@@ -370,6 +462,193 @@ class Service:
         if not sess or not sess.vm:
             return None
         return sess.vm.heap.snapshot(sess.vm.frame_snapshot())
+
+def _json_value(value: Any):
+    """把 VM 返回值转成 JSON 可序列化结构（原始值保持 JSON 原生类型）。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return rt.serialize_value(value)
+
+
+class RunSession:
+    """后台交互式运行会话：input() 阻塞等待，后续 HTTP 请求可继续投递输入。"""
+
+    def __init__(self, sid, source, options, pid=None, vid=None, service=None):
+        self.id = sid
+        self.source = source
+        self.options = options or {}
+        self.project_id = pid
+        self.version_id = vid
+        self.service = service
+        self.result = compiler_mod.compile_source(source)
+        self.vm: Optional[vm_mod.VM] = None
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.RLock()
+        self.finished_event = threading.Event()
+        self.input_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self.sent_inputs: List[str] = []
+        self.eof_sent = False
+        self.waiting_input = False
+        self.finished = False
+        self.status = "starting"
+        self.record = None
+        self.started_at = time.time()
+
+        initial = _normalize_inputs(self.options.get("inputs"))
+        self.sent_inputs.extend(initial)
+        for item in initial:
+            self.input_queue.put(item)
+
+    def start(self):
+        if not self.result.success:
+            self.status = "compile_failed"
+            self.finished = True
+            self.finished_event.set()
+            return
+        self.vm = vm_mod.VM(self.result.bytecode, self.result.source_lines)
+        self.vm.input_reader = self._read_input
+        self.status = "running"
+        self.thread = threading.Thread(target=self._worker, name=f"minilang-run-{self.id}", daemon=True)
+        self.thread.start()
+
+    def _read_input(self) -> str:
+        with self.lock:
+            if self.finished:
+                return ""
+            self.waiting_input = True
+            self.status = "waiting_input"
+        item = self.input_queue.get()
+        with self.lock:
+            self.waiting_input = False
+            if not self.finished:
+                self.status = "running"
+            if item is None:
+                self.eof_sent = True
+                self.vm.input_eof = True
+                item = ""
+            return item
+
+    def _worker(self):
+        try:
+            self.vm.start()
+            self.vm.run()
+        except Exception:
+            # VM 已把语言运行期错误写入 self.error；这里仅兜底宿主异常。
+            if self.vm.error is None:
+                self.status = "error"
+        finally:
+            self._finish()
+
+    def _finish(self):
+        with self.lock:
+            self.finished = True
+            self.waiting_input = False
+            if self.status != "compile_failed":
+                self.status = "error" if self.vm and self.vm.error else "finished"
+            rec = self._build_record_locked()
+            self.record = rec
+        self.finished_event.set()
+        if self.service and self.project_id and self.version_id and self.status != "compile_failed":
+            try:
+                self.service._persist_run_record(self.project_id, self.version_id, rec)
+                self.service._write_global_run_record(self.project_id, self.version_id, rec)
+            except Exception:
+                # 持久化失败不影响本次会话返回；普通请求的外层异常处理会记录 500。
+                pass
+
+    def _build_record_locked(self):
+        if not self.vm:
+            return None
+        return {
+            "id": storage.new_id("run"),
+            "timestamp": storage.now_iso(),
+            "elapsed_ms": round(self.vm.elapsed_ms(), 3),
+            "ok": self.vm.error is None,
+            "output": list(self.vm.output),
+            "return_value": _json_value(self.vm.return_value),
+            "instruction_count": self.vm.instruction_count,
+            "input_requests": self.vm.input_requests,
+            "inputs_consumed": self.vm.inputs_consumed,
+            "input_underflow": self.vm.input_underflow,
+            "inputs": list(self.sent_inputs),
+            "error": self.vm.error.to_dict() if self.vm.error else None,
+            "profiled": False,
+            "interactive": True,
+        }
+
+    def send_inputs(self, value):
+        items = _normalize_inputs(value)
+        if sum(len(item) for item in items) > 1_000_000:
+            return {"ok": False, "error": "单次投递输入总长度超过 1MB 上限"}
+        with self.lock:
+            if self.status == "compile_failed":
+                return {"ok": False, "error": "编译失败，无法投递输入"}
+            if self.finished:
+                return {"ok": False, "error": "程序已结束，无法投递输入"}
+            if self.eof_sent:
+                return {"ok": False, "error": "已发送 EOF，不能继续投递输入"}
+            if len(self.sent_inputs) >= 10000:
+                return {"ok": False, "error": "单次运行的输入条目超过 10000 条上限"}
+            for item in items:
+                self.sent_inputs.append(item)
+                self.input_queue.put(item)
+            return self.state(accepted=len(items))
+
+    def send_eof(self):
+        with self.lock:
+            if self.status == "compile_failed":
+                return {"ok": False, "error": "编译失败，无需发送 EOF"}
+            if self.finished:
+                return {"ok": False, "error": "程序已结束"}
+            if not self.eof_sent:
+                self.eof_sent = True
+                self.input_queue.put(None)
+            return self.state(eof=True)
+
+    def stop(self):
+        # daemon 线程无法安全强制终止；EOF 可解除 input() 等待，其余由指令上限保护。
+        return self.send_eof()
+
+    def state(self, accepted=None, eof=None):
+        with self.lock:
+            if self.status == "compile_failed":
+                return {
+                    "ok": True,
+                    "session_id": self.id,
+                    "project_id": self.project_id,
+                    "version_id": self.version_id,
+                    "status": "compile_failed",
+                    "finished": True,
+                    "diagnostics": self.result.diagnostics.to_list(),
+                    "output": [],
+                }
+            data = {
+                "ok": True,
+                "session_id": self.id,
+                "project_id": self.project_id,
+                "version_id": self.version_id,
+                "status": self.status,
+                "running": not self.finished,
+                "finished": self.finished,
+                "waiting_input": self.waiting_input,
+                "output": list(self.vm.output) if self.vm else [],
+                "error": self.vm.error.to_dict() if self.vm and self.vm.error else None,
+                "elapsed_ms": round(self.vm.elapsed_ms(), 3) if self.vm else 0.0,
+                "instruction_count": self.vm.instruction_count if self.vm else 0,
+                "input_requests": self.vm.input_requests if self.vm else 0,
+                "inputs_consumed": self.vm.inputs_consumed if self.vm else 0,
+                "input_underflow": self.vm.input_underflow if self.vm else 0,
+                "pending_inputs": self.input_queue.qsize(),
+                "inputs_sent": len(self.sent_inputs),
+                "eof_sent": self.eof_sent,
+                "return_value": _json_value(self.vm.return_value) if self.vm else None,
+                "record": self.record,
+            }
+            if accepted is not None:
+                data["accepted"] = accepted
+            if eof:
+                data["eof"] = True
+            return data
 
 
 class DebugSession:

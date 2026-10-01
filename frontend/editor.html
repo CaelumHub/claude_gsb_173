@@ -22,6 +22,7 @@
           <button class="btn accent" id="btn-run">▶ 运行</button>
           <button class="btn" id="btn-prof">📈 运行 + 剖析</button>
           <button class="btn success" id="btn-save">💾 保存版本</button>
+          <button class="btn success" id="btn-save-run">🧾 保存版本并运行</button>
         </div>
       </div>
 
@@ -29,11 +30,29 @@
 
       <div id="status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
 
-      <div class="grid cols-2 mt">
+      <div class="grid cols-3 mt run-grid">
         <div class="card">
           <h2>▶ 控制台输出</h2>
           <div class="output-console" id="console"><span class="muted">尚未运行。点击「运行」执行当前代码。</span></div>
           <div class="muted mt" id="run-meta" style="font-size:12px"></div>
+        </div>
+        <div class="card">
+          <h2>⌨️ 标准输入</h2>
+          <div class="desc">每行对应一次 <code>input()</code，按调用顺序消费；可在运行前预填，也可在提示等待时追加。</div>
+          <div class="stdin-toolbar">
+            <input type="text" id="stdin-input" placeholder="输入一条内容，Enter 送入队列" autocomplete="off">
+            <button class="btn sm" id="stdin-send">送入</button>
+            <button class="btn sm" id="stdin-batch" title="一次粘贴多行，每行一条">多行</button>
+            <button class="btn sm" id="stdin-eof" title="等待 input() 时返回空字符串">EOF</button>
+            <button class="btn sm" id="stdin-clear">清空</button>
+          </div>
+          <div class="stdin-hint">
+            <span class="badge purple" id="stdin-status">空闲</span>
+            <span id="stdin-count" class="muted">待消费 0 · 已送达 0 · 已消费 0</span>
+          </div>
+          <div class="stdin-queue" id="stdin-queue">
+            <div class="muted empty-inputs">运行前可先填写多条输入；运行中也能继续补充。</div>
+          </div>
         </div>
         <div class="card">
           <h2>🩺 诊断信息</h2>
@@ -74,6 +93,134 @@
     ML.toast(ML.Shell.getProjectId() ? "已载入项目源码" : "未选择项目，已载入示例代码");
   };
 
+  /* 标准输入队列：运行前预填；交互式运行时也可继续投递 */
+  const stdin = {
+    pending: [],
+    sent: 0,
+    consumed: 0,
+    sessionId: null,
+    pollTimer: null,
+    active: false,
+
+    reset(keepQueue) {
+      if (this.pollTimer) clearInterval(this.pollTimer);
+      this.pollTimer = null;
+      this.sessionId = null;
+      this.active = false;
+      this.sent = 0;
+      this.consumed = 0;
+      if (!keepQueue) this.pending = [];
+      this.render({ status: "空闲", cls: "purple" });
+      document.getElementById("btn-run").disabled = false;
+      document.getElementById("btn-save-run").disabled = false;
+    },
+
+    enqueue(value) {
+      this.pending.push(String(value));
+      this.render(this.currentBadge());
+    },
+
+    addFromInput() {
+      const el = document.getElementById("stdin-input");
+      const value = el.value;
+      el.value = "";
+      if (this.active && this.sessionId) {
+        return this.send([value]);
+      }
+      this.enqueue(value);
+      el.focus();
+      return Promise.resolve();
+    },
+
+    async send(items) {
+      if (!this.active || !this.sessionId) {
+        items.forEach((v) => this.enqueue(v));
+        return;
+      }
+      const data = await ML.api.runInput(this.sessionId, items);
+      if (!data.ok) {
+        ML.toast(data.error || "输入投递失败", "err");
+        return;
+      }
+      this.sent += (data.accepted || items.length);
+      this.updateFromState(data);
+    },
+
+    async eof() {
+      if (!this.active || !this.sessionId) {
+        ML.toast("只有运行中的会话需要发送 EOF");
+        return;
+      }
+      const data = await ML.api.runEof(this.sessionId);
+      if (data.ok) this.updateFromState(data);
+    },
+
+    clear() {
+      if (this.active) {
+        ML.toast("运行中只能清空尚未预填的输入，不能撤回已送达内容", "err");
+        return;
+      }
+      this.pending = [];
+      this.render({ status: "空闲", cls: "purple" });
+    },
+
+    currentBadge() {
+      if (!this.active) return { status: "待运行", cls: "cyan" };
+      return { status: "运行中", cls: "blue" };
+    },
+
+    render(badge, state) {
+      const queueEl = document.getElementById("stdin-queue");
+      const statusEl = document.getElementById("stdin-status");
+      const countEl = document.getElementById("stdin-count");
+      statusEl.textContent = (badge && badge.status) || "空闲";
+      statusEl.className = "badge " + ((badge && badge.cls) || "purple");
+
+      const pendingCount = state ? state.pending_inputs : this.pending.length;
+      const sentCount = state ? state.inputs_sent : 0;
+      const consumedCount = state ? state.inputs_consumed : this.consumed;
+      countEl.textContent = `待消费 ${pendingCount} · 已送达 ${sentCount} · 已消费 ${consumedCount}`;
+
+      const pending = state ? Array.from({ length: state.pending_inputs }, (_, i) => ({ queued: true, index: i + 1 })) : this.pending.map((v) => ({ queued: false, value: v }));
+      queueEl.innerHTML = pending.length
+        ? pending.map((item, i) => item.queued
+          ? `<div class="stdin-item"><span class="idx">${item.index}</span><span class="val"><em>已在服务端队列等待</em></span><span class="tag">待消费</span></div>`
+          : `<div class="stdin-item"><span class="idx">${i + 1}</span><span class="val">${ML.escapeHtml(item.value) || '<em>空字符串</em>'}</span><span class="tag">待运行</span></div>`).join("")
+        : '<div class="muted empty-inputs">运行前可先填写多条输入；运行中也能继续补充。</div>';
+
+      document.getElementById("stdin-eof").disabled = !(state && state.running);
+      document.getElementById("stdin-clear").disabled = this.active;
+    },
+
+    updateFromState(state) {
+      const waiting = state.waiting_input;
+      const badge = state.finished
+        ? { status: state.error ? "运行出错" : "已结束", cls: state.error ? "red" : "green" }
+        : waiting
+          ? { status: "等待输入", cls: "amber" }
+          : { status: "运行中", cls: "blue" };
+      this.render(badge, state);
+    },
+  };
+
+  document.getElementById("stdin-send").onclick = () => stdin.addFromInput();
+  document.getElementById("stdin-batch").onclick = async () => {
+    const text = prompt("一次填入多条输入（每行一条，空行也是一次空输入）：");
+    if (text === null) return;
+    const items = text.split(/\r?\n/);
+    if (stdin.active && stdin.sessionId) await stdin.send(items);
+    else items.forEach((v) => stdin.enqueue(v));
+  };
+  document.getElementById("stdin-eof").onclick = () => stdin.eof();
+  document.getElementById("stdin-clear").onclick = () => stdin.clear();
+  document.getElementById("stdin-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      stdin.addFromInput();
+    }
+  });
+  stdin.reset(true);
+
   /* 编译 */
   async function doCompile() {
     const code = editor.getValue();
@@ -96,21 +243,10 @@
     return r;
   }
 
-  /* 运行 */
-  async function doRun(profile) {
-    const code = editor.getValue();
-    const opts = profile ? { profile: true, memory: false } : {};
-    const data = await ML.api.run(code, opts);
-    const r = data.result || {};
+  /* 运行结果渲染（同步剖析与交互式运行共用） */
+  function renderRunResult(r, code) {
     const consoleEl = document.getElementById("console");
     const meta = document.getElementById("run-meta");
-
-    if (!r.ok) {
-      consoleEl.innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
-      document.getElementById("diags").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
-      meta.textContent = "编译失败：" + (r.stage || "");
-      return;
-    }
 
     if (r.output && r.output.length) {
       consoleEl.innerHTML = r.output.map((l) => `<span class="ln-out">${ML.escapeHtml(l)}</span>`).join("<br>");
@@ -118,7 +254,10 @@
       consoleEl.innerHTML = '<span class="muted">（程序无输出）</span>';
     }
 
-    let metaHtml = `⏱ ${ML.fmtMs(r.elapsed_ms)} · 指令 ${r.instruction_count}`;
+    let metaHtml = `⏱ ${ML.fmtMs(r.elapsed_ms)} · 指令 ${r.instruction_count} · input ${r.inputs_consumed || 0}/${r.input_requests || 0}`;
+    if (r.input_underflow > 0) {
+      metaHtml += ` · ${ML.badge(`${r.input_underflow} 次缺少输入，按空字符串处理`, "amber")}`;
+    }
     if (r.error) {
       metaHtml += ` · ${ML.badge("运行出错", "red")}`;
       const diag = Object.assign({}, r.error, { source_line: undefined });
@@ -129,8 +268,100 @@
       document.getElementById("diags").innerHTML = ML.empty("✅ 运行正常，无诊断信息");
     }
     meta.innerHTML = metaHtml;
+  }
 
-    if (profile && r.profile) {
+  function renderInteractiveState(state, code) {
+    const consoleEl = document.getElementById("console");
+    if (state.output && state.output.length) {
+      consoleEl.innerHTML = state.output.map((l) => `<span class="ln-out">${ML.escapeHtml(l)}</span>`).join("<br>");
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    } else if (!state.finished) {
+      consoleEl.innerHTML = '<span class="muted">程序已启动，暂无输出……</span>';
+    }
+    stdin.updateFromState(state);
+    if (state.finished) {
+      if (stdin.pollTimer) {
+        clearInterval(stdin.pollTimer);
+        stdin.pollTimer = null;
+      }
+      renderRunResult(state, code);
+      stdin.active = false;
+      stdin.sessionId = null;
+      stdin.updateFromState(state);
+      document.getElementById("btn-run").disabled = false;
+      document.getElementById("btn-save-run").disabled = false;
+      if (state.record && state.record.id) {
+        ML.toast(state.version_id ? "运行记录已写入该版本" : "运行已结束", "ok");
+      }
+    }
+  }
+
+  /* 普通运行：启动后台交互会话，支持运行中追加输入 */
+  async function doRun() {
+    if (stdin.active) {
+      ML.toast("当前程序仍在运行，请先结束或发送 EOF", "err");
+      return;
+    }
+    const code = editor.getValue();
+    const inputs = stdin.pending.slice();
+    stdin.reset(true);
+    stdin.pending = inputs;
+    stdin.active = true;
+    document.getElementById("btn-run").disabled = true;
+    document.getElementById("btn-save-run").disabled = true;
+    document.getElementById("diags").innerHTML = ML.empty("程序运行中……");
+    document.getElementById("console").innerHTML = '<span class="muted">正在启动……</span>';
+
+    try {
+      const data = await ML.api.runInteractive(code, { inputs }, ML.Shell.getProjectId(), null);
+      if (data.status === "compile_failed") {
+        stdin.reset(true);
+        document.getElementById("console").innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
+        document.getElementById("diags").innerHTML = ML.renderDiagnostics(data.diagnostics, code);
+        document.getElementById("run-meta").textContent = "编译失败";
+        return;
+      }
+      if (!data.ok) throw new Error(data.error || "启动失败");
+      stdin.sessionId = data.session_id;
+      stdin.updateFromState(data);
+      if (data.finished) {
+        renderInteractiveState(data, code);
+        return;
+      }
+      stdin.pollTimer = setInterval(async () => {
+        const s = await ML.api.runState(stdin.sessionId);
+        if (!s.ok) {
+          clearInterval(stdin.pollTimer);
+          stdin.reset(true);
+          ML.toast(s.error || "运行会话已过期", "err");
+          return;
+        }
+        if (s.finished || s.waiting_input) renderInteractiveState(s, code);
+        else stdin.updateFromState(s);
+      }, 250);
+    } catch (e) {
+      stdin.reset(true);
+      document.getElementById("console").innerHTML = `<span class="ln-err">${ML.escapeHtml(e.message || "运行失败")}</span>`;
+    }
+  }
+
+  /* 剖析仍使用同步运行；预填输入会作为队列一次性传入 */
+  async function doProfileRun() {
+    const code = editor.getValue();
+    const opts = { profile: true, memory: false, inputs: stdin.pending.slice() };
+    const data = await ML.api.run(code, opts);
+    const r = data.result || {};
+
+    if (!r.ok) {
+      document.getElementById("console").innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
+      document.getElementById("diags").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
+      document.getElementById("run-meta").textContent = "编译失败：" + (r.stage || "");
+      return;
+    }
+
+    renderRunResult(r, code);
+
+    if (r.profile) {
       const fns = (r.profile.functions || []).slice(0, 5);
       document.getElementById("diags").innerHTML =
         `<h3 style="margin-top:0">🔥 热点函数 Top ${fns.length}</h3>` +
@@ -142,8 +373,8 @@
   }
 
   document.getElementById("btn-compile").onclick = doCompile;
-  document.getElementById("btn-run").onclick = () => doRun(false);
-  document.getElementById("btn-prof").onclick = () => doRun(true);
+  document.getElementById("btn-run").onclick = doRun;
+  document.getElementById("btn-prof").onclick = doProfileRun;
   document.getElementById("btn-save").onclick = async () => {
     if (!ML.Shell.getProjectId()) {
       ML.toast("未选择项目。请先在顶栏选择项目，或到「项目管理」页新建。", "err");
@@ -153,6 +384,56 @@
     if (msg === null) return;
     const v = await ML.Shell.saveToProject(editor.getValue(), msg);
     ML.toast(v ? "已保存版本" : "保存失败", v ? "ok" : "err");
+  };
+  document.getElementById("btn-save-run").onclick = async () => {
+    if (stdin.active) {
+      ML.toast("当前程序仍在运行，请先结束或发送 EOF", "err");
+      return;
+    }
+    const pid = ML.Shell.getProjectId();
+    if (!pid) {
+      ML.toast("未选择项目；普通运行不会写入版本记录。", "err");
+      return;
+    }
+    const msg = prompt("版本说明（本次运行将记录到这个新版本）：", "运行前保存版本");
+    if (msg === null) return;
+    const saved = await ML.Shell.saveToProject(editor.getValue(), msg);
+    if (!saved) {
+      ML.toast("版本保存失败，运行已取消", "err");
+      return;
+    }
+    const code = editor.getValue();
+    const inputs = stdin.pending.slice();
+    stdin.reset(true);
+    stdin.pending = inputs;
+    stdin.active = true;
+    document.getElementById("btn-run").disabled = true;
+    document.getElementById("btn-save-run").disabled = true;
+    const data = await ML.api.runInteractive(code, { inputs }, pid, saved.id);
+    if (data.status === "compile_failed") {
+      stdin.reset(true);
+      document.getElementById("console").innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
+      document.getElementById("diags").innerHTML = ML.renderDiagnostics(data.diagnostics, code);
+      document.getElementById("run-meta").textContent = "编译失败";
+      return;
+    }
+    stdin.sessionId = data.session_id;
+    stdin.updateFromState(data);
+    if (!data.finished) {
+      stdin.pollTimer = setInterval(async () => {
+        const s = await ML.api.runState(stdin.sessionId);
+        if (!s.ok) {
+          clearInterval(stdin.pollTimer);
+          stdin.reset(true);
+          ML.toast(s.error || "运行会话已过期", "err");
+          return;
+        }
+        if (s.finished || s.waiting_input) renderInteractiveState(s, code);
+        else stdin.updateFromState(s);
+      }, 250);
+    } else {
+      renderInteractiveState(data, code);
+    }
   };
 })();
 </script>
