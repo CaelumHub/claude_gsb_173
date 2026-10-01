@@ -17,6 +17,7 @@ import shutil
 import time
 import difflib
 import hashlib
+import threading
 from typing import Dict, List, Optional
 
 from . import config
@@ -96,6 +97,10 @@ class Service:
         config.ensure_dirs()
         self.debug_sessions: Dict[str, "DebugSession"] = {}
         self._session_counter = 0
+        # 交互式运行会话（持有可续跑的 VM，等待用户逐条送入 input）
+        self.run_sessions: Dict[str, "RunSession"] = {}
+        self._run_session_counter = 0
+        self._run_sessions_lock = threading.Lock()
 
     # ==================================================================
     # 项目管理
@@ -271,7 +276,7 @@ class Service:
             if options.get("sample", True):
                 prof.start_sampling(float(options.get("sample_interval_ms", 1.0)))
         if options.get("inputs"):
-            vm.input_queue = list(options["inputs"])
+            vm.input_queue = [str(x) for x in options["inputs"]]
         vm.start()
         vm.run()
         if prof:
@@ -284,6 +289,7 @@ class Service:
         out = {
             "ok": True,
             "output": list(vm.output),
+            "inputs": list(vm.inputs_consumed),
             "return_value": vm.return_value,
             "error": vm.error.to_dict() if vm.error else None,
             "instruction_count": vm.instruction_count,
@@ -296,19 +302,30 @@ class Service:
     def record_run(self, pid, vid, source, options=None):
         """运行并持久化运行记录到版本目录。"""
         options = options or {}
-        started = time.time()
         out = self.run(source, options)
-        rec = {
+        rec = self._build_run_record(out)
+        self._persist_run_record(rec, pid, vid)
+        return rec
+
+    @staticmethod
+    def _build_run_record(out):
+        """根据一次运行结果构造运行记录（兼容缺少 inputs 字段的旧调用）。"""
+        return {
             "id": storage.new_id("run"),
             "timestamp": storage.now_iso(),
             "elapsed_ms": out.get("elapsed_ms", 0.0),
             "ok": out.get("ok", False),
             "output": out.get("output", []),
+            "inputs": out.get("inputs", []),
             "return_value": out.get("return_value"),
             "instruction_count": out.get("instruction_count", 0),
             "error": out.get("error"),
             "profiled": bool(out.get("profile")),
         }
+
+    @staticmethod
+    def _persist_run_record(rec, pid, vid):
+        """把运行记录写入版本目录 run.json，并维护全局 runs 索引。"""
         if pid and vid:
             vdir = storage.version_dir(pid, vid)
             run_path = os.path.join(vdir, "run.json")
@@ -324,7 +341,6 @@ class Service:
         global_rec["project_id"] = pid
         global_rec["version_id"] = vid
         storage.write_json(os.path.join(config.RUNS_DIR, rec["id"] + ".json"), global_rec)
-        return rec
 
     # ==================================================================
     # 调试会话
@@ -370,6 +386,160 @@ class Service:
         if not sess or not sess.vm:
             return None
         return sess.vm.heap.snapshot(sess.vm.frame_snapshot())
+
+    # ==================================================================
+    # 交互式运行会话（运行前可预填输入；运行中 input() 挂起，逐条续送）
+    # ==================================================================
+    def _new_run_session_id(self):
+        self._run_session_counter += 1
+        return f"run-{self._run_session_counter:x}-{int(time.time()*1000)%100000:x}"
+
+    def _prune_run_sessions(self, keep_id=None):
+        """回收已结束的会话，避免长期驻留占内存。"""
+        dead = [sid for sid, s in self.run_sessions.items()
+                if sid != keep_id and (s.vm is None or s.vm.finished)]
+        for sid in dead:
+            self.run_sessions.pop(sid, None)
+
+    def run_start(self, source, inputs=None, pid=None, vid=None):
+        """创建并推进一个交互式运行会话。
+
+        inputs 为运行前预填的输入（按顺序逐条被 input() 消费）；预填项耗尽后
+        若程序再次调用 input()，会话进入 waiting_input 状态等待 run_feed 续送。
+        """
+        with self._run_sessions_lock:
+            sid = self._new_run_session_id()
+            sess = RunSession(sid, source, inputs, pid, vid)
+            # 同一前端页面串行使用：开始新会话前回收旧会话
+            self._prune_run_sessions()
+            self.run_sessions[sid] = sess
+            sess.advance()
+            return sess.state()
+
+    def run_feed(self, sid, value):
+        """向等待输入的会话送入一条输入并继续执行。"""
+        with self._run_sessions_lock:
+            sess = self.run_sessions.get(sid)
+            if sess is None:
+                return {"ok": False, "error": "运行会话不存在或已结束", "session_id": sid}
+            return sess.feed(value)
+
+    def run_session_state(self, sid):
+        with self._run_sessions_lock:
+            sess = self.run_sessions.get(sid)
+            if sess is None:
+                return {"ok": False, "error": "运行会话不存在或已结束", "session_id": sid}
+            return sess.state()
+
+    def run_stop(self, sid):
+        with self._run_sessions_lock:
+            sess = self.run_sessions.pop(sid, None)
+            return {"ok": True, "removed": bool(sess)}
+
+    def run_sessions_list(self):
+        with self._run_sessions_lock:
+            return [{"session_id": s.id, "project_id": s.project_id,
+                     "waiting_input": bool(s.vm and s.vm.paused and s.vm.pause_reason == "input"),
+                     "finished": bool(s.vm and s.vm.finished)}
+                    for s in self.run_sessions.values()]
+
+
+class RunSession:
+    """一个交互式运行会话：VM 在 input() 处可挂起，跨 HTTP 请求续跑。
+
+    与 DebugSession 一样状态驻留内存；程序结束后产出的运行记录通过与普通
+    运行相同的存储路径写入版本 run.json 与全局 runs 索引。
+    """
+
+    def __init__(self, sid, source, inputs=None, pid=None, vid=None):
+        self.id = sid
+        self.source = source
+        self.project_id = pid or None
+        self.version_id = vid or None
+        self.inputs_preloaded = list(inputs or [])
+        self.result = compiler_mod.compile_source(source)
+        self.vm: Optional[vm_mod.VM] = None
+        self.recorded = False
+        self.record = None
+        if self.result.success:
+            self.vm = vm_mod.VM(self.result.bytecode, self.result.source_lines)
+            self.vm.interactive_input = True
+            self.vm.input_queue = [str(x) for x in self.inputs_preloaded]
+
+    def advance(self):
+        """从当前状态推进，直到下一次 input 挂起、程序结束或出错。"""
+        if self.vm is None or self.vm.finished:
+            return self._finish_if_needed()
+        if not self.vm.frames:
+            self.vm.start()
+        self.vm.run()
+        return self._finish_if_needed()
+
+    def feed(self, value):
+        """送入一条输入（空字符串也允许，input() 本就可能读到空行）并续跑。"""
+        if self.vm is None:
+            return self.state()
+        if not (self.vm.paused and self.vm.pause_reason == "input"):
+            # 程序当前不在等输入：忽略并返回现状，避免乱序送入
+            return self.state()
+        self.vm.feed_input("" if value is None else str(value))
+        self.vm.run()
+        self._finish_if_needed()
+        return self.state()
+
+    def _finish_if_needed(self):
+        if self.vm is not None and self.vm.finished and not self.recorded:
+            self._persist()
+        return self.state()
+
+    def _persist(self):
+        """运行结束：复用 Service 的运行记录结构与存储路径留档。"""
+        from . import runtime as rt
+        vm = self.vm
+        rv = vm.return_value
+        out = {
+            "ok": True,
+            "output": list(vm.output),
+            "inputs": list(vm.inputs_consumed),
+            "return_value": rt.serialize_value(rv) if rv is not None else None,
+            "error": vm.error.to_dict() if vm.error else None,
+            "instruction_count": vm.instruction_count,
+            "elapsed_ms": round(vm.elapsed_ms(), 3),
+        }
+        rec = Service._build_run_record(out)
+        Service._persist_run_record(rec, self.project_id, self.version_id)
+        self.record = rec
+        self.recorded = True
+
+    def state(self):
+        if not self.result.success:
+            return {
+                "ok": False,
+                "compile_failed": True,
+                "session_id": self.id,
+                "diagnostics": self.result.diagnostics.to_list(),
+                "source_lines": self.result.source_lines,
+            }
+        from . import runtime as rt
+        vm = self.vm
+        waiting = bool(vm.paused and vm.pause_reason == "input")
+        rv = vm.return_value
+        return {
+            "ok": True,
+            "session_id": self.id,
+            "finished": vm.finished,
+            "waiting_input": waiting,
+            "input_line": vm.input_line if waiting else 0,
+            "input_count": len(vm.inputs_consumed),
+            "inputs": list(vm.inputs_consumed),
+            "pending_inputs": list(vm.input_queue),
+            "output": list(vm.output),
+            "return_value": rt.serialize_value(rv) if rv is not None else None,
+            "error": vm.error.to_dict() if vm.error else None,
+            "instruction_count": vm.instruction_count,
+            "elapsed_ms": round(vm.elapsed_ms(), 3),
+            "record_id": self.record["id"] if self.record else None,
+        }
 
 
 class DebugSession:

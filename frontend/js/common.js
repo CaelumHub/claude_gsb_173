@@ -83,6 +83,23 @@
         "print(area);",
       ].join("\n"),
     },
+    {
+      name: "交互式输入（input）",
+      code: [
+        "// 在控制台下方「标准输入」里预填，每行一条；",
+        "// 或直接运行，程序等待时在输入框逐条送入。",
+        "print(\"你叫什么名字？\");",
+        "var name = input();",
+        "print(\"你好，\", name);",
+        "print(\"请输入一个数字：\");",
+        "var n = int(input());",
+        "var total = 0;",
+        "for (var i = 1; i <= n; i = i + 1) {",
+        "    total = total + i;",
+        "}",
+        "print(\"1 到 \", n, \" 的和 = \", total);",
+      ].join("\n"),
+    },
   ];
 
   ML.DEFAULT_CODE = ML.SAMPLES[0].code;
@@ -142,6 +159,14 @@
     // ---- 编译 / 运行 ----
     compile(source, detail) { return this.post("/api/compile", { source, detail: detail || "all" }); },
     run(source, options) { return this.post("/api/run", { source, options: options || {} }); },
+
+    // ---- 交互式运行 ----
+    runStart(source, inputs, pid, vid) {
+      return this.post("/api/run/start", { source, inputs: inputs || [], project_id: pid || null, version_id: vid || null });
+    },
+    runFeed(sid, input) { return this.post(`/api/run/${encodeURIComponent(sid)}/feed`, { input }); },
+    runState(sid) { return this.get(`/api/run/${encodeURIComponent(sid)}/state`); },
+    runStop(sid) { return this.post(`/api/run/${encodeURIComponent(sid)}/stop`); },
 
     // ---- 调试 ----
     debugStart(source, breakpoints, pid, vid) { return this.post("/api/debug/start", { source, breakpoints: breakpoints || [], project_id: pid, version_id: vid }); },

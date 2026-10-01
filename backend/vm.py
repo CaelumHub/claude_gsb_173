@@ -76,6 +76,11 @@ class VM:
         self.error: Optional[diag.Diagnostic] = None
         self.output: List[str] = []
         self.input_queue: List[str] = []
+        # 已被 input() 实际消费的输入（按顺序记录，供运行记录留档）
+        self.inputs_consumed: List[str] = []
+        # 交互模式：队列耗尽后遇到 input() 挂起，等待外部送入下一条输入
+        self.interactive_input = False
+        self.input_line = 0
         self.return_value = None
         self.profiler = None
         self.debugger = None
@@ -136,6 +141,8 @@ class VM:
         self.pause_reason = None
         self.error = None
         self.instruction_count = 0
+        self.inputs_consumed = []
+        self.input_line = 0
         self._start_time = time.perf_counter()
         if self.profiler:
             self.profiler.begin_run()
@@ -201,6 +208,15 @@ class VM:
                 if on_pause is not None:
                     on_pause(self)
                 return self
+            if self._is_input_wait():
+                # 交互模式：input() 等待外部送入输入，VM 原样挂起以便跨请求续跑
+                ins = self.peek_instruction()
+                self.input_line = ins.line if ins else 0
+                self.paused = True
+                self.pause_reason = "input"
+                if on_pause is not None:
+                    on_pause(self)
+                return self
             if max_steps is not None and steps >= max_steps:
                 return self
             self.step_instruction()
@@ -208,6 +224,26 @@ class VM:
             if self.paused:
                 return self
         return self
+
+    def _is_input_wait(self) -> bool:
+        """下一条待执行指令是否为「无输入可取的 input() 调用」。"""
+        if not self.interactive_input or self.input_queue:
+            return False
+        ins = self.peek_instruction()
+        if ins is None or ins.op != bc.OP_CALL:
+            return False
+        frame = self.frames[-1]
+        idx = len(frame.stack) - 1 - ins.operand
+        if idx < 0:
+            return False
+        return frame.stack[idx] is self.builtins.get("input")
+
+    def feed_input(self, value: str):
+        """送入一条输入并解除 input 挂起（调用方随后驱动 run 续跑）。"""
+        self.input_queue.append(value)
+        self.input_line = 0
+        self.paused = False
+        self.pause_reason = None
 
     def _handle_runtime_error(self, e: VMRuntimeError):
         self.error = e.diagnostic
@@ -625,7 +661,9 @@ class VM:
 
     def _bi_input(self, args):
         if self.input_queue:
-            return self.input_queue.pop(0)
+            value = self.input_queue.pop(0)
+            self.inputs_consumed.append(value)
+            return value
         return ""
 
     def _bi_time(self, args):

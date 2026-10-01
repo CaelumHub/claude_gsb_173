@@ -158,6 +158,29 @@ class Handler(BaseHTTPRequestHandler):
             out = svc.run(body.get("source", ""), opts)
             return self._json(200, {"ok": True, "result": out})
 
+        # ---- 交互式运行（运行前预填输入 / 运行中逐条续送 input） ----
+        if path == "/api/run/start" and method == "POST":
+            inputs = body.get("inputs", [])
+            if not isinstance(inputs, list):
+                inputs = []
+            state = svc.run_start(body.get("source", ""), inputs,
+                                  body.get("project_id") or None,
+                                  body.get("version_id") or None)
+            return self._json(200, state)
+
+        m = re.match(r"^/api/run/([^/]+)/feed$", path)
+        if m and method == "POST":
+            state = svc.run_feed(m.group(1), body.get("input", ""))
+            return self._json(200, state)
+        m = re.match(r"^/api/run/([^/]+)/state$", path)
+        if m and method == "GET":
+            return self._json(200, svc.run_session_state(m.group(1)))
+        m = re.match(r"^/api/run/([^/]+)/stop$", path)
+        if m and method == "POST":
+            return self._json(200, svc.run_stop(m.group(1)))
+        if path == "/api/run/sessions" and method == "GET":
+            return self._json(200, {"ok": True, "sessions": svc.run_sessions_list()})
+
         # ---- 调试 ----
         if path == "/api/debug/start" and method == "POST":
             state = svc.debug_start(body.get("source", ""), body.get("breakpoints", []),

@@ -33,6 +33,19 @@
         <div class="card">
           <h2>▶ 控制台输出</h2>
           <div class="output-console" id="console"><span class="muted">尚未运行。点击「运行」执行当前代码。</span></div>
+          <div class="stdin-box">
+            <div class="stdin-head">
+              <strong>⌨️ 标准输入（stdin）</strong>
+              <span class="muted">— 每行一条，按代码中 input() 调用顺序逐条消费；也可在程序运行等待时逐条输入。内容随草稿自动保存。</span>
+            </div>
+            <textarea class="stdin-pre" id="stdin-pre" spellcheck="false"
+              placeholder="运行前预填输入，每行一条，例如：&#10;42&#10;hello"></textarea>
+            <div class="stdin-feed" id="stdin-feed">
+              <span class="prompt" id="stdin-prompt">›</span>
+              <input type="text" id="stdin-input" autocomplete="off" placeholder="输入本条 input() 的内容，回车发送（空行也会作为空字符串送达）">
+              <button class="btn accent sm" id="btn-send-input">发送</button>
+            </div>
+          </div>
           <div class="muted mt" id="run-meta" style="font-size:12px"></div>
         </div>
         <div class="card">
@@ -96,27 +109,188 @@
     return r;
   }
 
-  /* 运行 */
+  /* 运行（交互式会话：预填输入按行入队；input() 等待时可逐条续送） */
+  const consoleEl = document.getElementById("console");
+  const meta = document.getElementById("run-meta");
+  const stdinPre = document.getElementById("stdin-pre");
+  const stdinFeed = document.getElementById("stdin-feed");
+  const stdinInput = document.getElementById("stdin-input");
+  const stdinPrompt = document.getElementById("stdin-prompt");
+  stdinPre.value = ML.store.get("draft_stdin", "");
+  stdinPre.addEventListener("input", ML.debounce(() => ML.store.set("draft_stdin", stdinPre.value), 400));
+
+  let runSessionId = null;
+  let renderedOutputs = 0;
+  let renderedInputs = 0;
+
+  function readPrefilledInputs() {
+    // 每行一条；保留空行（input() 可能读到空字符串）；整块未填写时不送任何输入
+    const raw = stdinPre.value.replace(/^\n+|\n+$/g, "");
+    return raw === "" ? [] : raw.split("\n");
+  }
+
+  function appendLine(text, cls) {
+    if (consoleEl.querySelector(".muted") || consoleEl.querySelector(".ln-sys")) consoleEl.innerHTML = "";
+    const span = document.createElement("span");
+    span.className = cls || "ln-out";
+    span.textContent = text;
+    if (consoleEl.childNodes.length) consoleEl.appendChild(document.createElement("br"));
+    consoleEl.appendChild(span);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+
+  /* 按到达顺序渲染。input() 的返回值要到后续 print 才能观察到，因此预填输入行
+     只在「程序再次等待输入」或「程序结束」这两个安全时点回显；用户在输入框
+     当场发送的输入已在发送时立即回显（计入 renderedInputs），这里不会重复。 */
+  function renderTranscript(state) {
+    const inputs = state.inputs || [];
+    const outputs = state.output || [];
+    if (state.waiting_input || state.finished) {
+      while (renderedInputs < inputs.length || renderedOutputs < outputs.length) {
+        if (renderedOutputs <= renderedInputs && renderedOutputs < outputs.length) {
+          // 下一条输出属于「当前已回显输入之后」尚未出现的输出：先补输入
+          if (renderedInputs < inputs.length) {
+            appendLine("› " + inputs[renderedInputs], "ln-in");
+            renderedInputs += 1;
+          } else {
+            appendLine(outputs[renderedOutputs], "ln-out");
+            renderedOutputs += 1;
+          }
+        } else if (renderedOutputs < outputs.length) {
+          appendLine(outputs[renderedOutputs], "ln-out");
+          renderedOutputs += 1;
+        } else if (renderedInputs < inputs.length) {
+          appendLine("› " + inputs[renderedInputs], "ln-in");
+          renderedInputs += 1;
+        }
+      }
+    } else {
+      while (renderedOutputs < outputs.length) {
+        appendLine(outputs[renderedOutputs], "ln-out");
+        renderedOutputs += 1;
+      }
+    }
+    if (state.finished && !outputs.length && !inputs.length) {
+      consoleEl.innerHTML = '<span class="muted">（程序无输出）</span>';
+    }
+  }
+
+  function setWaitingUI(state, waiting) {
+    if (waiting) {
+      stdinFeed.classList.add("show");
+      stdinInput.disabled = false;
+      const n = (state.input_count || 0) + 1;
+      stdinPrompt.textContent = `第 ${n} 条›`;
+      stdinInput.placeholder =
+        `程序在第 ${state.input_line || "?"} 行调用 input()，等待第 ${n} 条输入（回车发送，空行作为空字符串）`;
+      stdinInput.focus();
+    } else {
+      stdinFeed.classList.remove("show");
+      stdinInput.disabled = true;
+      stdinInput.value = "";
+    }
+  }
+
   async function doRun(profile) {
     const code = editor.getValue();
-    const opts = profile ? { profile: true, memory: false } : {};
-    const data = await ML.api.run(code, opts);
-    const r = data.result || {};
-    const consoleEl = document.getElementById("console");
-    const meta = document.getElementById("run-meta");
+    const inputs = readPrefilledInputs();
 
+    // 关闭上一轮会话，避免旧会话驻留
+    if (runSessionId) { try { await ML.api.runStop(runSessionId); } catch (e) {} }
+    runSessionId = null;
+    renderedOutputs = 0;
+    renderedInputs = 0;
+    consoleEl.innerHTML = '<span class="ln-sys">⏳ 正在运行…</span>';
+    meta.textContent = "";
+
+    if (profile) {
+      // 剖析模式：一次性运行，预填输入随 options 送入（运行中不支持续送）
+      const data = await ML.api.run(code, { profile: true, memory: false, inputs });
+      renderOneShot(data.result || {}, code, true);
+      return;
+    }
+
+    let data;
+    try {
+      data = await ML.api.runStart(code, inputs, ML.Shell.getProjectId());
+    } catch (e) {
+      consoleEl.innerHTML = '<span class="ln-err">运行请求失败：' + ML.escapeHtml(e.message || String(e)) + "</span>";
+      return;
+    }
+    if (data.compile_failed || data.ok === false) {
+      consoleEl.innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
+      document.getElementById("diags").innerHTML = ML.renderDiagnostics(data.diagnostics, code);
+      meta.textContent = "编译失败";
+      return;
+    }
+    runSessionId = data.session_id;
+    renderInteractiveState(data, code);
+  }
+
+  async function sendInteractiveInput() {
+    if (!runSessionId) return;
+    const value = stdinInput.value;
+    stdinInput.disabled = true;
+    appendLine("› " + value, "ln-in");
+    renderedInputs += 1;
+    stdinInput.value = "";
+    let data;
+    try {
+      data = await ML.api.runFeed(runSessionId, value);
+    } catch (e) {
+      stdinInput.disabled = false;
+      appendLine("（输入发送失败：" + ML.escapeHtml(e.message || String(e)) + "）", "ln-err");
+      return;
+    }
+    renderInteractiveState(data, editor.getValue());
+  }
+
+  function renderInteractiveState(state, code) {
+    renderTranscript(state);
+    if (state.waiting_input && renderedOutputs === 0 && renderedInputs === 0) {
+      consoleEl.innerHTML = '<span class="muted">程序已启动，正在等待第 1 条输入…</span>';
+    }
+    if (state.waiting_input) {
+      setWaitingUI(state, true);
+      let metaHtml = `⏱ ${ML.fmtMs(state.elapsed_ms)} · 指令 ${state.instruction_count} · ` +
+        ML.badge("等待输入", "amber");
+      const pending = (state.pending_inputs || []).length;
+      if (pending) metaHtml += ` · 队列中还有 ${pending} 条预填输入`;
+      meta.innerHTML = metaHtml;
+      return;
+    }
+    setWaitingUI(state, false);
+    let metaHtml = `⏱ ${ML.fmtMs(state.elapsed_ms)} · 指令 ${state.instruction_count}`;
+    if (state.error) {
+      metaHtml += ` · ${ML.badge("运行出错", "red")}`;
+      const diag = Object.assign({}, state.error, { source_line: undefined });
+      document.getElementById("diags").innerHTML = ML.renderDiagnostic(diag, code);
+    } else {
+      metaHtml += ` · ${ML.badge("正常结束", "green")}`;
+      if (state.return_value) metaHtml += ` · 返回 ${ML.fmtVal(state.return_value)}`;
+      document.getElementById("diags").innerHTML = ML.empty("✅ 运行正常，无诊断信息");
+    }
+    if ((state.inputs || []).length) metaHtml += ` · 共消费 ${state.inputs.length} 条输入`;
+    if (state.record_id) metaHtml += " · 已记录到版本历史";
+    meta.innerHTML = metaHtml;
+    runSessionId = null;  // 会话已结束
+  }
+
+  function renderOneShot(r, code, profile) {
     if (!r.ok) {
       consoleEl.innerHTML = '<span class="ln-err">程序未能运行（编译阶段存在错误）。</span>';
       document.getElementById("diags").innerHTML = ML.renderDiagnostics(r.diagnostics, code);
       meta.textContent = "编译失败：" + (r.stage || "");
       return;
     }
-
+    const parts = [];
     if (r.output && r.output.length) {
-      consoleEl.innerHTML = r.output.map((l) => `<span class="ln-out">${ML.escapeHtml(l)}</span>`).join("<br>");
-    } else {
-      consoleEl.innerHTML = '<span class="muted">（程序无输出）</span>';
+      parts.push(r.output.map((l) => `<span class="ln-out">${ML.escapeHtml(l)}</span>`).join("<br>"));
     }
+    if ((r.inputs || []).length) {
+      parts.push(r.inputs.map((x) => `<span class="ln-in">› ${ML.escapeHtml(x)}</span>`).join("<br>"));
+    }
+    consoleEl.innerHTML = parts.length ? parts.join("<br>") : '<span class="muted">（程序无输出）</span>';
 
     let metaHtml = `⏱ ${ML.fmtMs(r.elapsed_ms)} · 指令 ${r.instruction_count}`;
     if (r.error) {
@@ -140,6 +314,13 @@
         `<div class="muted" style="font-size:12px;margin-top:8px">完整剖析请前往 <a href="profile.html">性能分析页</a></div>`;
     }
   }
+
+  stdinFeed.classList.remove("show");
+  stdinInput.disabled = true;
+  document.getElementById("btn-send-input").onclick = sendInteractiveInput;
+  stdinInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); sendInteractiveInput(); }
+  });
 
   document.getElementById("btn-compile").onclick = doCompile;
   document.getElementById("btn-run").onclick = () => doRun(false);
